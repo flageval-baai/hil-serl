@@ -801,6 +801,31 @@ def open(
     else:
         if len(found_devices) <= DeviceNumber:
             DeviceNumber = 0
+
+        if len(found_devices) == 1:
+            # Check that the input configuration has the correct components
+            # Raise an exception if it encounters incorrect component.
+            check_config(callback, dof_callback, dof_callback_arr, button_callback, button_callback_arr)
+            # create a copy of the device specification
+            spec = found_devices[0]["Spec"]
+            dev0 = found_devices[0]["HIDDevice"]
+            new_device0 = copy.deepcopy(spec)
+            new_device0.device = dev0
+
+            # set the callbacks
+            new_device0.callback = callback
+            new_device0.dof_callback = dof_callback
+            new_device0.dof_callback_arr = dof_callback_arr
+            new_device0.button_callback = button_callback
+            new_device0.button_callback_arr = button_callback_arr
+            # open the device
+            new_device0.open()
+            # set nonblocking/blocking mode
+            new_device0.set_nonblocking_loop = set_nonblocking_loop
+            dev0.set_nonblocking(set_nonblocking_loop)
+            
+            _active_device = [new_device0]
+            return _active_device
         
         if len(found_devices) == 2:
             # Check that the input configuration has the correct components
@@ -841,7 +866,6 @@ def open(
             # set nonblocking/blocking mode
             new_device1.set_nonblocking_loop = set_nonblocking_loop
             dev1.set_nonblocking(set_nonblocking_loop)
-
 
             _active_device = [new_device0, new_device1]
             return _active_device

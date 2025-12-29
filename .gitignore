@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+ENV/
+env/
+
+# Logs / temp files
+*.log
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ROS / Catkin
+.ros/
+*.bag
+*.bag.active
+*.bag.orig
+.catkin_tools/
+.catkin_workspace
+**/build/
+**/devel/
+**/install/
+**/log/
+
+# Experiment outputs
+/wandb/
+/runs/
+/outputs/
+/checkpoints/

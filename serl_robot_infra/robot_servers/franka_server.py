@@ -3,6 +3,7 @@ This file starts a control server running on the real time PC connected to the f
 In a screen run `python franka_server.py`
 """
 from flask import Flask, request, jsonify
+from franka_env.utils.rotations import euler_2_quat
 import numpy as np
 import rospy
 import time
@@ -16,9 +17,10 @@ from serl_franka_controllers.msg import ZeroJacobian
 import geometry_msgs.msg as geom_msg
 from dynamic_reconfigure.client import Client as ReconfClient
 
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
-    "robot_ip", "172.16.0.2", "IP address of the franka robot's controller box"
+    "robot_ip", "172.16.0.3", "IP address of the franka robot's controller box"
 )
 flags.DEFINE_string(
     "gripper_ip", "192.168.1.114", "IP address of the robotiq gripper if being used"
@@ -45,7 +47,7 @@ class FrankaServer:
     def __init__(self, robot_ip, gripper_type, ros_pkg_name, reset_joint_target):
         self.robot_ip = robot_ip
         self.ros_pkg_name = ros_pkg_name
-        self.reset_joint_target = reset_joint_target
+        self.reset_joint_target = [float(x) for x in reset_joint_target]
         self.gripper_type = gripper_type
 
         self.eepub = rospy.Publisher(
@@ -199,9 +201,14 @@ def main(_):
     rospy.init_node("franka_control_api")
 
     if GRIPPER_TYPE == "Robotiq":
-        from robot_servers.robotiq_gripper_server import RobotiqGripperServer
+        if GRIPPER_IP.startswith("0"):
+            from robot_servers.pyrobotiq_gripper_server import RobotiqGripperServer
+            gripper_server = RobotiqGripperServer()
+        else:
+            from robot_servers.robotiq_gripper_server import RobotiqGripperServer
 
-        gripper_server = RobotiqGripperServer(gripper_ip=GRIPPER_IP)
+            gripper_server = RobotiqGripperServer(gripper_ip=GRIPPER_IP)
+
     elif GRIPPER_TYPE == "Franka":
         from robot_servers.franka_gripper_server import FrankaGripperServer
 
@@ -379,6 +386,17 @@ def main(_):
     def update_param():
         reconf_client.update_configuration(request.json)
         return "Updated compliance parameters"
+    
+    @webapp.route("/reset_all", methods = ["POST"])
+    def reset_all():
+        print('resetting all')
+        robot_server.clear()
+        gripper_server.open()
+        goal =  np.array([0.5671124922989944,6.47218270568564e-05,0.4951717570264977,3.1406597193535584,-0.06601965456071524,4.5924120475993035e-05])
+        goal = np.concatenate([goal[:3], euler_2_quat(goal[3:])])
+        pos = np.array(goal).astype(np.float32)
+        robot_server.move(pos)
+        return 'reset all done'
 
     webapp.run(host=FLAGS.flask_url)
 

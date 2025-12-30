@@ -12,6 +12,8 @@ import threading
 from datetime import datetime
 from collections import OrderedDict
 from typing import Dict
+from urllib.parse import urljoin
+import json as _json
 
 from franka_env.camera.video_capture import VideoCapture
 from franka_env.camera.rs_capture import RSCapture
@@ -91,7 +93,7 @@ class FrankaEnv(gym.Env):
         self._TARGET_POSE = config.TARGET_POSE
         self._RESET_POSE = config.RESET_POSE
         self._REWARD_THRESHOLD = config.REWARD_THRESHOLD
-        self.url = config.SERVER_URL
+        self.url = self._normalize_base_url(config.SERVER_URL)
         self.config = config
         self.max_episode_length = config.MAX_EPISODE_LENGTH
         self.display_image = config.DISPLAY_IMAGE
@@ -157,7 +159,7 @@ class FrankaEnv(gym.Env):
             return
 
         self.cap = None
-        self.init_cameras(config.REALSENSE_CAMERAS)
+        # self.init_cameras(config.REALSENSE_CAMERAS)
         if self.display_image:
             self.img_queue = queue.Queue()
             self.displayer = ImageDisplayer(self.img_queue, self.url)
@@ -165,7 +167,7 @@ class FrankaEnv(gym.Env):
 
         if set_load:
             input("Put arm into programing mode and press enter.")
-            requests.post(self.url + "set_load", json=self.config.LOAD_PARAM)
+            self._post_json("set_load", payload=self.config.LOAD_PARAM, timeout_s=10.0)
             input("Put arm into execution mode and press enter.")
             for _ in range(2):
                 self._recover()
@@ -181,6 +183,52 @@ class FrankaEnv(gym.Env):
             self.listener.start()
 
         print("Initialized Franka")
+
+    @staticmethod
+    def _normalize_base_url(url: str) -> str:
+        url = (url or "").strip()
+        if not url:
+            raise ValueError("SERVER_URL is empty")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "http://" + url
+        if not url.endswith("/"):
+            url += "/"
+        return url
+
+    def _post_json(self, endpoint: str, payload=None, timeout_s: float = 3.0):
+        """POST to the Franka server and parse JSON with clearer failures.
+
+        This avoids crashes like requests.exceptions.JSONDecodeError when the server
+        returns HTML/empty responses or is down.
+        """
+        url = urljoin(self.url, endpoint)
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout_s)
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Failed to reach Franka server at {url}. "
+                f"Is franka_server.py running and SERVER_URL correct? ({type(e).__name__}: {e})"
+            ) from e
+
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            body = (resp.text or "").strip()
+            snippet = body[:500] if body else "<empty body>"
+            raise RuntimeError(
+                f"Franka server error calling {url}: HTTP {resp.status_code}. Response: {snippet}"
+            ) from e
+
+        try:
+            return resp.json()
+        except (requests.exceptions.JSONDecodeError, _json.JSONDecodeError) as e:
+            body = (resp.text or "").strip()
+            snippet = body[:500] if body else "<empty body>"
+            ct = resp.headers.get("Content-Type", "<missing>")
+            raise RuntimeError(
+                f"Expected JSON from {url} but got invalid JSON. "
+                f"Content-Type={ct}, HTTP {resp.status_code}, Response: {snippet}"
+            ) from e
 
     def clip_safety_box(self, pose: np.ndarray) -> np.ndarray:
         """Clip the pose to be within the safety box."""
@@ -412,24 +460,24 @@ class FrankaEnv(gym.Env):
 
     def _recover(self):
         """Internal function to recover the robot from error state."""
-        requests.post(self.url + "clearerr")
+        self._post_json("clearerr", timeout_s=3.0)
 
     def _send_pos_command(self, pos: np.ndarray):
         """Internal function to send position command to the robot."""
         self._recover()
         arr = np.array(pos).astype(np.float32)
         data = {"arr": arr.tolist()}
-        requests.post(self.url + "pose", json=data)
+        self._post_json("pose", payload=data, timeout_s=3.0)
 
     def _send_gripper_command(self, pos: float, mode="binary"):
         """Internal function to send gripper command to the robot."""
         if mode == "binary":
             if (pos <= -0.5) and (self.curr_gripper_pos > 0.85) and (time.time() - self.last_gripper_act > self.gripper_sleep):  # close gripper
-                requests.post(self.url + "close_gripper")
+                self._post_json("close_gripper", timeout_s=5.0)
                 self.last_gripper_act = time.time()
                 time.sleep(self.gripper_sleep)
             elif (pos >= 0.5) and (self.curr_gripper_pos < 0.85) and (time.time() - self.last_gripper_act > self.gripper_sleep):  # open gripper
-                requests.post(self.url + "open_gripper")
+                self._post_json("open_gripper", timeout_s=5.0)
                 self.last_gripper_act = time.time()
                 time.sleep(self.gripper_sleep)
             else: 
@@ -441,7 +489,7 @@ class FrankaEnv(gym.Env):
         """
         Internal function to get the latest state of the robot and its gripper.
         """
-        ps = requests.post(self.url + "getstate").json()
+        ps = self._post_json("getstate", timeout_s=3.0)
         self.currpos = np.array(ps["pose"])
         self.currvel = np.array(ps["vel"])
 
@@ -458,7 +506,7 @@ class FrankaEnv(gym.Env):
         """
         Internal function to get the latest state of the robot and its gripper.
         """
-        ps = requests.post(self.url + "getstate").json()
+        ps = self._post_json("getstate", timeout_s=3.0)
         self.currpos = np.array(ps["pose"])
         self.currvel = np.array(ps["vel"])
 
@@ -472,7 +520,8 @@ class FrankaEnv(gym.Env):
         self.curr_gripper_pos = np.array(ps["gripper_pos"])
 
     def _get_obs(self) -> dict:
-        images = self.get_im()
+        # images = self.get_im()
+        images = {"wrist_1": np.random.rand(128, 128, 3), "wrist_2": np.random.rand(128, 128, 3)}
         state_observation = {
             "tcp_pose": self.currpos,
             "tcp_vel": self.currvel,

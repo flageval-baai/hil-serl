@@ -9,6 +9,7 @@ import rospy
 import time
 import subprocess
 import threading
+import os
 from contextlib import contextmanager
 from scipy.spatial.transform import Rotation as R
 from absl import app, flags
@@ -17,8 +18,24 @@ from typing import Optional
 from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
 from franka_msgs.srv import SetLoad
 from serl_franka_controllers.msg import ZeroJacobian
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import geometry_msgs.msg as geom_msg
 from dynamic_reconfigure.client import Client as ReconfClient
+
+try:
+    import rosgraph
+except Exception:
+    rosgraph = None
+
+try:
+    from controller_manager_msgs.srv import ListControllers, LoadController, SwitchController
+    from controller_manager_msgs.srv import SwitchControllerRequest
+except Exception:
+    ListControllers = None
+    LoadController = None
+    SwitchController = None
+    SwitchControllerRequest = None
 
 
 FLAGS = flags.FLAGS
@@ -47,6 +64,9 @@ class FrankaServer:
     """Handles the starting and stopping of the impedance controller
     (as well as backup) joint recovery policy."""
 
+    CARTESIAN_CONTROLLER = "cartesian_impedance_controller"
+    JOINT_STREAM_CONTROLLER = "streaming_joint_impedance_controller"
+
     def __init__(self, robot_ip, gripper_type, ros_pkg_name, reset_joint_target):
         self.robot_ip = robot_ip
         self.ros_pkg_name = ros_pkg_name
@@ -67,10 +87,23 @@ class FrankaServer:
             self.dq = np.zeros((7,), dtype=np.float64)
             self.jacobian = np.zeros((6, 7), dtype=np.float64)
 
+        self.control_mode = "cartesian"  # cartesian | joint | stopped
+
+        self._cm_ns = None
+        self._cm_list_srv = None
+        self._cm_load_srv = None
+        self._cm_switch_srv = None
+        self._streaming_loaded = False
+
         self.eepub = rospy.Publisher(
             "/cartesian_impedance_controller/equilibrium_pose",
             geom_msg.PoseStamped,
             queue_size=10,
+        )
+        self.joint_traj_pub = rospy.Publisher(
+            "/position_joint_trajectory_controller/command", 
+            JointTrajectory, 
+            queue_size=10
         )
         self.resetpub = rospy.Publisher(
             "/franka_control/error_recovery/goal", ErrorRecoveryActionGoal, queue_size=1
@@ -83,6 +116,14 @@ class FrankaServer:
         time.sleep(1)
         self.state_sub = rospy.Subscriber(
             "franka_state_controller/franka_states", FrankaState, self._set_currpos
+        )
+
+        self.joint_names = [f"panda_joint{i+1}" for i in range(7)]
+        self.joint_target_pub = rospy.Publisher(
+            f"/{self.JOINT_STREAM_CONTROLLER}/joint_target",
+            JointState,
+            queue_size=1,
+            tcp_nodelay=True,
         )
 
     @contextmanager
@@ -99,6 +140,159 @@ class FrankaServer:
 
     def is_resetting(self) -> bool:
         return self._resetting.is_set()
+
+    def _get_arm_id(self) -> str:
+        for key in ("/franka_control/arm_id", "/franka_state_controller/arm_id", "/arm_id"):
+            try:
+                value = rospy.get_param(key)
+                if isinstance(value, str) and value:
+                    return value
+            except Exception:
+                pass
+        return "panda"
+
+    def _resolve_controller_manager_namespace(self, timeout_s: float = 8.0) -> str:
+        if ListControllers is None:
+            raise RuntimeError("controller_manager_msgs is not available in this environment")
+
+        default_ns = "/controller_manager"
+        try:
+            rospy.wait_for_service(f"{default_ns}/list_controllers", timeout=timeout_s)
+            return default_ns
+        except Exception:
+            pass
+
+        if rosgraph is None:
+            raise RuntimeError("rosgraph is not available; cannot discover controller_manager services")
+
+        master = rosgraph.masterapi.Master(rospy.get_name())
+        _, _, services = master.getSystemState()
+        candidates = [name for name, _providers in services if name.endswith("/list_controllers")]
+        if not candidates:
+            raise RuntimeError("No controller_manager/list_controllers service found")
+
+        best = sorted(candidates, key=len)[0]
+        return best[: -len("/list_controllers")]
+
+    def _ensure_controller_manager_clients(self, timeout_s: float = 8.0) -> None:
+        if self._cm_list_srv is not None and self._cm_load_srv is not None and self._cm_switch_srv is not None:
+            return
+        if self._cm_ns is None:
+            self._cm_ns = self._resolve_controller_manager_namespace(timeout_s=timeout_s)
+
+        rospy.wait_for_service(f"{self._cm_ns}/list_controllers", timeout=timeout_s)
+        rospy.wait_for_service(f"{self._cm_ns}/load_controller", timeout=timeout_s)
+        rospy.wait_for_service(f"{self._cm_ns}/switch_controller", timeout=timeout_s)
+
+        self._cm_list_srv = rospy.ServiceProxy(f"{self._cm_ns}/list_controllers", ListControllers)
+        self._cm_load_srv = rospy.ServiceProxy(f"{self._cm_ns}/load_controller", LoadController)
+        self._cm_switch_srv = rospy.ServiceProxy(f"{self._cm_ns}/switch_controller", SwitchController)
+
+    def _list_controllers(self):
+        self._ensure_controller_manager_clients()
+        return self._cm_list_srv().controller
+
+    def _is_controller_loaded(self, name: str) -> bool:
+        try:
+            for c in self._list_controllers():
+                if c.name == name:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _load_controller(self, name: str) -> bool:
+        self._ensure_controller_manager_clients()
+        try:
+            resp = self._cm_load_srv(name)
+            return bool(getattr(resp, "ok", False))
+        except Exception as e:
+            rospy.logwarn(f"load_controller({name}) failed: {e}")
+            return False
+
+    def _switch_controllers(self, start, stop) -> bool:
+        self._ensure_controller_manager_clients()
+        strict = SwitchControllerRequest.STRICT if SwitchControllerRequest is not None else 2
+        resp = self._cm_switch_srv(start, stop, strict, True, 0.0)
+        return bool(getattr(resp, "ok", False))
+
+    def _configure_streaming_joint_controller_params(self) -> None:
+        arm_id = self._get_arm_id()
+        self.joint_names = [f"{arm_id}_joint{i+1}" for i in range(7)]
+
+        base = f"/{self.JOINT_STREAM_CONTROLLER}"
+        rospy.set_param(f"{base}/type", "serl_franka_joint_streaming_controller/StreamingJointImpedanceController")
+        rospy.set_param(f"{base}/arm_id", arm_id)
+        rospy.set_param(f"{base}/joint_names", self.joint_names)
+        rospy.set_param(f"{base}/target_topic", "joint_target")
+
+        rospy.set_param(f"{base}/k_gains", [200.0, 200.0, 200.0, 200.0, 80.0, 50.0, 30.0])
+        rospy.set_param(f"{base}/d_gains", [20.0, 20.0, 20.0, 20.0, 10.0, 8.0, 6.0])
+        rospy.set_param(f"{base}/max_position_error", 0.15)
+        rospy.set_param(f"{base}/command_timeout", 0.2)
+        rospy.set_param(f"{base}/delta_tau_max", 1.0)
+
+        rospy.set_param(f"{base}/estimate_dq_from_q", True)
+        rospy.set_param(f"{base}/dq_max", 0.5)
+        rospy.set_param(f"{base}/ddq_max", 2.0)
+        rospy.set_param(f"{base}/q_filter", 0.01)
+        rospy.set_param(f"{base}/dq_filter", 0.05)
+
+    def _preload_streaming_joint_controller(self, timeout_s: float = 10.0) -> bool:
+        if LoadController is None:
+            rospy.logwarn("controller_manager_msgs is missing; joint streaming control is disabled")
+            return False
+
+        deadline = time.monotonic() + timeout_s
+        last_error = None
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            try:
+                self._ensure_controller_manager_clients(timeout_s=2.0)
+                self._configure_streaming_joint_controller_params()
+                if not self._is_controller_loaded(self.JOINT_STREAM_CONTROLLER):
+                    ok = self._load_controller(self.JOINT_STREAM_CONTROLLER)
+                    if not ok:
+                        last_error = "load_controller returned ok=false"
+                        time.sleep(0.5)
+                        continue
+                self._streaming_loaded = True
+                return True
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(0.5)
+        rospy.logwarn(f"Failed to preload joint streaming controller: {last_error}")
+        return False
+
+    def start_joint_control(self) -> bool:
+        with self._command_lock:
+            if self._resetting.is_set():
+                return False
+            if not self._streaming_loaded:
+                self._preload_streaming_joint_controller(timeout_s=10.0)
+            if not self._streaming_loaded:
+                return False
+
+            ok = self._switch_controllers([self.JOINT_STREAM_CONTROLLER], [self.CARTESIAN_CONTROLLER])
+            if ok:
+                self.control_mode = "joint"
+            return ok
+
+    def stop_joint_control(self) -> bool:
+        with self._command_lock:
+            if self._resetting.is_set():
+                return False
+            ok = self._switch_controllers([self.CARTESIAN_CONTROLLER], [self.JOINT_STREAM_CONTROLLER])
+            if ok:
+                self.control_mode = "cartesian"
+            return ok
+
+    def send_joint_target_q(self, q_target: np.ndarray) -> None:
+        q_target = np.asarray(q_target, dtype=np.float64).reshape((7,))
+        msg = JointState()
+        msg.header.stamp = rospy.Time.now()
+        msg.name = list(self.joint_names)
+        msg.position = [float(x) for x in q_target.tolist()]
+        self.joint_target_pub.publish(msg)
 
     def start_reset_joint_async(self) -> bool:
         if self._resetting.is_set():
@@ -160,6 +354,9 @@ class FrankaServer:
     def start_impedance(self):
         """Launches the impedance controller"""
         with self._command_lock:
+            proc = getattr(self, "imp", None)
+            if proc is not None and proc.poll() is None:
+                return
             self.imp = subprocess.Popen(
                 [
                     "roslaunch",
@@ -168,9 +365,12 @@ class FrankaServer:
                     "robot_ip:=" + self.robot_ip,
                     f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
                 ],
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
             )
             time.sleep(3)
+            self.control_mode = "cartesian"
+            self._preload_streaming_joint_controller(timeout_s=10.0)
 
     def stop_impedance(self):
         """Stops the impedance controller"""
@@ -184,6 +384,7 @@ class FrankaServer:
                 pass
             time.sleep(1)
             self.imp = None
+            self.control_mode = "stopped"
 
     def clear(self):
         """Clears any errors"""
@@ -216,7 +417,8 @@ class FrankaServer:
                     "robot_ip:=" + self.robot_ip,
                     f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
                 ],
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
             )
             time.sleep(1)
             print("RUNNING JOINT RESET")
@@ -260,6 +462,8 @@ class FrankaServer:
     def move(self, pose: list):
         """Moves to a pose: [x, y, z, qx, qy, qz, qw]"""
         with self._command_lock:
+            if self.control_mode != "cartesian":
+                raise RuntimeError(f"Cartesian pose control is not active (mode={self.control_mode})")
             assert len(pose) == 7
             msg = geom_msg.PoseStamped()
             msg.header.frame_id = "0"
@@ -411,6 +615,10 @@ def main(_):
             if not acquired:
                 return _busy("startimp")
             robot_server.clear()
+            try:
+                robot_server.stop_joint_control()
+            except Exception:
+                pass
             robot_server.start_impedance()
             return jsonify({"ok": True})
 
@@ -420,7 +628,50 @@ def main(_):
         with robot_server._try_command() as acquired:
             if not acquired:
                 return _busy("stopimp")
+            try:
+                robot_server.stop_joint_control()
+            except Exception:
+                pass
             robot_server.stop_impedance()
+            return jsonify({"ok": True})
+
+    # Route for switching to joint streaming torque control
+    @webapp.route("/start_joint_control", methods=["POST"])
+    def start_joint_control():
+        with robot_server._try_command() as acquired:
+            if not acquired:
+                return _busy("start_joint_control")
+            robot_server.clear()
+            ok = robot_server.start_joint_control()
+            if not ok:
+                return jsonify({"ok": False, "error": "failed to start joint control"}), 500
+            return jsonify({"ok": True})
+
+    # Route for switching back to Cartesian impedance control
+    @webapp.route("/stop_joint_control", methods=["POST"])
+    def stop_joint_control():
+        with robot_server._try_command() as acquired:
+            if not acquired:
+                return _busy("stop_joint_control")
+            robot_server.clear()
+            ok = robot_server.stop_joint_control()
+            if not ok:
+                return jsonify({"ok": False, "error": "failed to stop joint control"}), 500
+            return jsonify({"ok": True})
+
+    # Route for streaming joint targets (q only)
+    @webapp.route("/joint_q", methods=["POST"])
+    def joint_q():
+        with robot_server._try_command() as acquired:
+            if not acquired:
+                return _busy("joint_q")
+            data = request.get_json(silent=True) or {}
+            q = data.get("q", None)
+            if q is None:
+                q = data.get("arr", None)
+            if q is None:
+                return jsonify({"ok": False, "error": "missing 'q' (or 'arr')"}), 400
+            robot_server.send_joint_target_q(np.array(q, dtype=np.float64))
             return jsonify({"ok": True})
     
     # Route for pose in euler angles
@@ -571,7 +822,10 @@ def main(_):
         with robot_server._try_command() as acquired:
             if not acquired:
                 return _busy("pose")
-            robot_server.move(pos)
+            try:
+                robot_server.move(pos)
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
             return jsonify({"ok": True})
 
     # Route for getting all state information
@@ -598,6 +852,8 @@ def main(_):
         with robot_server._try_command() as acquired:
             if not acquired:
                 return _busy("update_param")
+            if robot_server.control_mode != "cartesian":
+                return jsonify({"ok": False, "error": f"cartesian impedance not active (mode={robot_server.control_mode})"}), 400
             reconf_client.update_configuration(request.json)
             return jsonify({"ok": True})
 
@@ -608,6 +864,7 @@ def main(_):
                 "ok": True,
                 "resetting": robot_server.is_resetting(),
                 "state_ready": robot_server._state_ready.is_set(),
+                "mode": getattr(robot_server, "control_mode", "unknown"),
             }
         )
     

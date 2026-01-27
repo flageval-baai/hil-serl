@@ -730,6 +730,12 @@ def main(_):
         started = robot_server.start_reset_joint_async()
         if not started:
             return _busy("jointreset")
+        if gripper_server is None:
+            return jsonify({"ok": False, "error": "No gripper configured"}), 400
+        if robot_server.is_resetting():
+            return _busy("open_gripper")
+        with gripper_lock:
+            gripper_server.open()
         return jsonify({"ok": True, "started": True})
 
     # Route for Activating the Gripper

@@ -19,10 +19,8 @@ PYTHON_BIN="${PYTHON_BIN:-python}" # Python 解释器（例如 conda 环境里�
 
 FRANKA_URL="${FRANKA_URL:-http://127.0.0.2:5000/}" # 机器人端 franka_server.py 的 Flask 地址（例如 http://127.0.0.1:5000/；也可用环境变量覆盖）
 
-OPENPI_REMOTE_HOST="${OPENPI_REMOTE_HOST:-172.24.178.135}" # 模型端 OpenPI 服务所在机器/节点的可达 IP/域名（从跳板机侧能访问；也可用环境变量覆盖）
+OPENPI_REMOTE_HOST="${OPENPI_REMOTE_HOST:-192.168.200.233}" # 模型端 OpenPI 服务所在机器/节点的可达 IP/域名（从跳板机侧能访问；也可用环境变量覆盖）
 OPENPI_REMOTE_PORT="${OPENPI_REMOTE_PORT:-8000}"           # 模型端 OpenPI websocket 端口（你的日志显示监听 0.0.0.0:8000；也可用环境变量覆盖）
-
-OPENPI_LOCAL_PORT="${OPENPI_LOCAL_PORT:-9000}"             # 本机用于端口转发的端口（转发后本机用 127.0.0.1:PORT 访问；也可用环境变量覆盖）
 
 OPENPI_SSH_HOST="${OPENPI_SSH_HOST:-ssh.platform-sz.jingneng-inner.ac.cn}" # 跳板机 host（不要求本机 DNS 可解析，走 ProxyCommand；也可用环境变量覆盖）
 OPENPI_SSH_USER="${OPENPI_SSH_USER:-experiment3.zhaomingxuan.research-prod_flageval.cn-beijing-shangzhuang.ws}" # 跳板机登录用户名（也可用环境变量覆盖）
@@ -53,55 +51,13 @@ TUNNEL_WAIT_S="${TUNNEL_WAIT_S:-1.0}" # SSH 隧道启动后等待秒数（给端
 ###############################################################################
 ###############################################################################
 
-OPENPI_WS="ws://127.0.0.1:${OPENPI_LOCAL_PORT}" # 推理脚本连接的 websocket 地址（本地端口转发）
-
-CONTROL_PATH="/tmp/openpi_tunnel_${OPENPI_LOCAL_PORT}_$$.sock" # SSH 控制 socket（用于优雅关闭隧道）
-
-cleanup() {
-  # 优先通过 ControlMaster 关闭隧道（最稳）；失败则忽略
-  ssh -S "${CONTROL_PATH}" -O exit \
-    -p "${OPENPI_SSH_PORT}" \
-    -o "ProxyCommand=${OPENPI_PROXY_COMMAND}" \
-    "${OPENPI_SSH_USER}@${OPENPI_SSH_HOST}" >/dev/null 2>&1 || true
-  rm -f "${CONTROL_PATH}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT INT TERM
+OPENPI_WS="ws://${OPENPI_REMOTE_HOST}:${OPENPI_REMOTE_PORT}" # 推理脚本连接的 websocket 地址（本地端口转发）
 
 echo "[run] FRANKA_URL=${FRANKA_URL}"
 echo "[run] OPENPI_REMOTE=${OPENPI_REMOTE_HOST}:${OPENPI_REMOTE_PORT}"
 echo "[run] OPENPI_LOCAL=${OPENPI_WS}"
 echo "[run] SSH=${OPENPI_SSH_USER}@${OPENPI_SSH_HOST}:${OPENPI_SSH_PORT}"
 
-echo "[run] starting ssh tunnel...（如提示 Password，请输入；成功后 ssh 会自动后台运行）"
-ssh -fN \
-  -p "${OPENPI_SSH_PORT}" \
-  -o "ProxyCommand=${OPENPI_PROXY_COMMAND}" \
-  -o "ControlMaster=yes" \
-  -o "ControlPath=${CONTROL_PATH}" \
-  -o "ControlPersist=yes" \
-  -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=30 \
-  -L "${OPENPI_LOCAL_PORT}:${OPENPI_REMOTE_HOST}:${OPENPI_REMOTE_PORT}" \
-  "${OPENPI_SSH_USER}@${OPENPI_SSH_HOST}"
-
-sleep "${TUNNEL_WAIT_S}"
-
-if command -v curl >/dev/null 2>&1; then
-  echo "[run] checking openpi healthz via tunnel..."
-  ok=0
-  for _ in $(seq 1 20); do
-    if curl -sSf --max-time 1 "http://127.0.0.1:${OPENPI_LOCAL_PORT}/healthz" >/dev/null; then
-      ok=1
-      break
-    fi
-    sleep 0.3
-  done
-  if [[ "${ok}" != "1" ]]; then
-    echo "[error] healthz check failed. local_port=${OPENPI_LOCAL_PORT} remote=${OPENPI_REMOTE_HOST}:${OPENPI_REMOTE_PORT}" >&2
-    echo "[hint] 可能原因：1) SSH 密码/权限不对 2) 跳板机无法访问模型端 ${OPENPI_REMOTE_HOST}:${OPENPI_REMOTE_PORT} 3) 模型端服务未起来/端口不对" >&2
-    exit 1
-  fi
-fi
 
 if command -v curl >/dev/null 2>&1; then
   echo "[run] checking franka server..."

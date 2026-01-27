@@ -9,13 +9,17 @@ This script acts as a bridge:
   4) Receive an action dict and execute the (absolute) target pose + gripper command.
 
 Observation keys match the provided OpenPI RoboInputs transform:
-  - "observation.state": float32[14] = [q(7), gripper(1), pose_xyzrpy(6)]
+  - "observation.state": float32[14] = [q(7), gripper(1), pose_xyzrpy(6)] (default)
+  - "observation.state": float32[15] = [q(7), gripper(1), pose_xyzquat_xyzw(7)] (optional, see --state_format)
   - "observation.image_front": uint8[H,W,3]
   - "observation.image_wrist": uint8[H,W,3]
   - "prompt": str (optional)
 
 Action is expected to be:
-  - action_dict[action_key] = float32[T,7] or float32[7], with [x,y,z,rx,ry,rz,gripper]
+  - action_dict[action_key] = float32[T,D] or float32[D], where D is one of:
+      - 7:  [x,y,z,rx,ry,rz,gripper]                 (rpy, legacy)
+      - 8:  [x,y,z,qx,qy,qz,qw,gripper]               (quat xyzw)
+      - 15: [j1..j7,gripper,x,y,z,qx,qy,qz,qw]        (dataset-style; joints currently ignored)
     where gripper >= threshold triggers open, else close.
 
 Example:
@@ -126,10 +130,23 @@ class FrankaHttpClient:
     def reset_all(self) -> dict:
         return self._post_json("reset_all", payload={}, timeout_s=5.0)
 
+    def joint_reset(self) -> dict:
+        return self._post_json("jointreset", payload={}, timeout_s=5.0)
+
+    def start_joint_control(self) -> None:
+        self._post_json("start_joint_control", payload=None, timeout_s=8.0)
+
+    def stop_joint_control(self) -> None:
+        self._post_json("stop_joint_control", payload=None, timeout_s=8.0)
+
     def get_joint_positions(self) -> np.ndarray:
         data = self._post_json("getq", payload=None)
         q = np.asarray(data["q"], dtype=np.float32).reshape((7,))
         return q
+
+    def send_joint_q(self, q_target: np.ndarray) -> None:
+        q = np.asarray(q_target, dtype=np.float32).reshape((7,))
+        self._post_json("joint_q", payload={"q": q.tolist()})
 
     def get_pose_euler(self) -> np.ndarray:
         data = self._post_json("getpos_euler", payload=None)
@@ -223,14 +240,99 @@ def _extract_action(action_dict: dict, *, action_key: str) -> np.ndarray:
         raise KeyError(f"Missing action key '{action_key}' in response keys={list(action_dict.keys())}")
     actions = np.asarray(action_dict[action_key], dtype=np.float32)
     if actions.ndim == 1:
-        if actions.shape[0] != 7:
-            raise ValueError(f"Expected action shape (7,), got {actions.shape}")
+        if actions.shape[0] not in (7, 8, 15):
+            raise ValueError(f"Expected action shape (7,), (8,), or (15,), got {actions.shape}")
         return actions[None, :]
     if actions.ndim == 2:
-        if actions.shape[1] != 7:
-            raise ValueError(f"Expected action shape (T,7), got {actions.shape}")
+        if actions.shape[1] not in (7, 8, 15):
+            raise ValueError(f"Expected action shape (T,7), (T,8), or (T,15), got {actions.shape}")
         return actions
     raise ValueError(f"Unsupported action array rank {actions.ndim} with shape {actions.shape}")
+
+
+def _normalize_quat_xyzw(quat_xyzw: np.ndarray, *, eps: float = 1e-8) -> np.ndarray:
+    quat = np.asarray(quat_xyzw, dtype=np.float32).reshape((4,))
+    n = float(np.linalg.norm(quat))
+    if not np.isfinite(n) or n < eps:
+        raise ValueError(f"Invalid quaternion (norm={n}): {quat.tolist()}")
+    return (quat / n).astype(np.float32)
+
+
+def _maybe_flip_quat_sign(quat_xyzw: np.ndarray, prev_quat_xyzw: Optional[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    quat = np.asarray(quat_xyzw, dtype=np.float32).reshape((4,))
+    if prev_quat_xyzw is None:
+        return quat, quat
+    prev = np.asarray(prev_quat_xyzw, dtype=np.float32).reshape((4,))
+    if float(np.dot(prev, quat)) < 0.0:
+        quat = -quat
+    return quat, quat
+
+
+def _parse_action_step(
+    a: np.ndarray,
+    *,
+    action_format: str,
+    quat_normalize: bool,
+    quat_flip_sign: bool,
+    prev_quat_xyzw: Optional[np.ndarray],
+) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], float, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Parse one action step into (xyz, rpy, quat_xyzw, gripper, joints7, next_prev_quat_xyzw).
+    Exactly one of rpy/quat_xyzw is returned as not-None.
+    """
+    a = np.asarray(a, dtype=np.float32).reshape((-1,))
+    dim = int(a.shape[0])
+
+    if action_format != "auto":
+        expected = {"rpy7": 7, "quat8": 8, "quat15": 15, "joint8": 8}[action_format]
+        if dim != expected:
+            raise ValueError(f"--action_format={action_format} requires action dim {expected}, got {dim}")
+    else:
+        if dim == 7:
+            action_format = "rpy7"
+        elif dim == 8:
+            action_format = "quat8"
+        elif dim == 15:
+            action_format = "quat15"
+        else:
+            raise ValueError(f"Unsupported action dim {dim}; expected 7, 8, or 15")
+
+    joints7: Optional[np.ndarray] = None
+    rpy: Optional[np.ndarray] = None
+    quat_xyzw: Optional[np.ndarray] = None
+
+    if action_format == "joint8":
+        joints7 = a[:7].copy()
+        gripper = float(a[7])
+        xyz = np.zeros((3,), dtype=np.float32)
+        return xyz, None, None, gripper, joints7, prev_quat_xyzw
+
+    if action_format == "rpy7":
+        xyz = a[:3]
+        rpy = a[3:6]
+        gripper = float(a[6])
+        return xyz, rpy, None, gripper, None, prev_quat_xyzw
+
+    if action_format == "quat8":
+        xyz = a[:3]
+        quat_xyzw = a[3:7]
+        gripper = float(a[7])
+    elif action_format == "quat15":
+        joints7 = a[:7].copy()
+        gripper = float(a[7])
+        xyz = a[8:11]
+        quat_xyzw = a[11:15]
+    else:
+        raise ValueError(f"Unsupported action_format={action_format!r}")
+
+    if quat_xyzw is None:
+        raise AssertionError("quat_xyzw must be set for quaternion action formats")
+    if quat_normalize:
+        quat_xyzw = _normalize_quat_xyzw(quat_xyzw)
+    if quat_flip_sign:
+        quat_xyzw, prev_quat_xyzw = _maybe_flip_quat_sign(quat_xyzw, prev_quat_xyzw)
+
+    return xyz, None, quat_xyzw, float(gripper), joints7, prev_quat_xyzw
 
 
 def _maybe_resize_bgr(img: np.ndarray, *, resize_hw: Optional[tuple[int, int]]) -> np.ndarray:
@@ -254,10 +356,11 @@ def _maybe_save_obs(
     *,
     enabled: bool,
     every: int,
-    run_dir: Optional[Path],
+    run: Optional["_ObsSaver"],
     out_dir: str,
     step_idx: int,
-    state14: np.ndarray,
+    state: np.ndarray,
+    state_spec: str,
     front_img: np.ndarray,
     wrist_img: np.ndarray,
     front_serial: str,
@@ -265,16 +368,17 @@ def _maybe_save_obs(
     bgr_to_rgb: bool,
     resize_hw: Optional[tuple[int, int]],
     prompt: Optional[str],
-) -> Optional[Path]:
-    """Save exactly the tensors that are sent to the model (streaming)."""
+    video_fps: float,
+) -> Optional["_ObsSaver"]:
+    """Save the latest model inputs (overwrite) and record videos (finalize on exit)."""
     if not enabled:
-        return run_dir
+        return run
     if every <= 0:
-        return run_dir
+        return run
     if (step_idx % every) != 0:
-        return run_dir
+        return run
 
-    if run_dir is None:
+    if run is None:
         base = Path(out_dir).expanduser()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         run_dir = base / f"obs_{timestamp}"
@@ -282,7 +386,7 @@ def _maybe_save_obs(
 
         meta = {
             "provided_to_model": {
-                "observation.state": "float32[14] = [q(7), gripper(1), pose_xyzrpy(6)]",
+                "observation.state": state_spec,
                 "observation.image_front": "front camera image",
                 "observation.image_wrist": "wrist camera image",
                 "prompt": "optional text prompt",
@@ -292,47 +396,118 @@ def _maybe_save_obs(
                 "bgr_to_rgb": bool(bgr_to_rgb),
                 "resize_hw": list(resize_hw) if resize_hw is not None else None,
                 "note": (
-                    "Saved .npy arrays are exactly what was sent to the OpenPI server. "
-                    ".png are provided for convenient viewing (cv2 expects BGR)."
+                    "This folder is updated in-place during inference: latest .png frames overwrite "
+                    "previous ones for easy live observation; videos are finalized on exit."
                 ),
             },
         }
         (run_dir / "obs_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[obs] streaming-save model inputs to: {run_dir} (every={every})")
+        print(f"[obs] save latest frames + record videos to: {run_dir} (every={every})")
+        run = _ObsSaver(
+            run_dir=run_dir,
+            bgr_to_rgb=bgr_to_rgb,
+            video_fps=float(video_fps),
+        )
 
-    step_tag = f"{int(step_idx):06d}"
+    run.update(step_idx=step_idx, state=state, front_img=front_img, wrist_img=wrist_img, prompt=prompt)
+    return run
 
-    # Save EXACT tensors as provided to the model.
-    np.save(run_dir / f"observation.state.{step_tag}.npy", np.asarray(state14))
-    np.save(run_dir / f"observation.image_front.{step_tag}.npy", np.asarray(front_img))
-    np.save(run_dir / f"observation.image_wrist.{step_tag}.npy", np.asarray(wrist_img))
 
-    # Also save images in common formats for easy inspection.
-    # Note: cv2.imwrite expects BGR; if we converted to RGB for the model, swap back for correct colors.
+def _try_create_video_writer(path: Path, *, fps: float, frame_hw: tuple[int, int]):
     try:
         import cv2  # local import
 
-        front_for_png = front_img
-        wrist_for_png = wrist_img
-        if bgr_to_rgb:
-            front_for_png = front_for_png[..., ::-1]
-            wrist_for_png = wrist_for_png[..., ::-1]
+        # cv2.VideoWriter expects (W, H)
+        h, w = frame_hw
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(path), fourcc, float(fps), (int(w), int(h)))
+        if not writer.isOpened():
+            try:
+                writer.release()
+            except Exception:
+                pass
+            return None
+        return writer
+    except Exception:
+        return None
 
-        cv2.imwrite(str(run_dir / f"observation.image_front.{step_tag}.png"), front_for_png)
-        cv2.imwrite(str(run_dir / f"observation.image_wrist.{step_tag}.png"), wrist_for_png)
-    except Exception as e:
-        print(f"[obs] warning: failed to save .png images (cv2 unavailable or write failed): {e}")
 
-    step_info = {
-        "step_idx": int(step_idx),
-        "prompt": prompt,
-        "state_shape": list(np.asarray(state14).shape),
-        "front_shape": list(np.asarray(front_img).shape),
-        "wrist_shape": list(np.asarray(wrist_img).shape),
-    }
-    (run_dir / f"step_{step_tag}.json").write_text(json.dumps(step_info, ensure_ascii=False, indent=2), encoding="utf-8")
+@dataclass
+class _ObsSaver:
+    run_dir: Path
+    bgr_to_rgb: bool
+    video_fps: float
+    _front_writer: Any | None = None
+    _wrist_writer: Any | None = None
+    _video_ready: bool = False
 
-    return run_dir
+    def _ensure_video_writers(self, *, front_bgr: np.ndarray, wrist_bgr: np.ndarray) -> None:
+        if self._video_ready:
+            return
+
+        front_path = self.run_dir / "front.mp4"
+        wrist_path = self.run_dir / "wrist.mp4"
+
+        self._front_writer = _try_create_video_writer(front_path, fps=self.video_fps, frame_hw=front_bgr.shape[:2])
+        self._wrist_writer = _try_create_video_writer(wrist_path, fps=self.video_fps, frame_hw=wrist_bgr.shape[:2])
+
+        if self._front_writer is None or self._wrist_writer is None:
+            self._front_writer = None
+            self._wrist_writer = None
+            print("[obs] warning: failed to initialize video writers (cv2 unavailable or codec not supported); skipping videos")
+            self._video_ready = True
+            return
+
+        self._video_ready = True
+
+    def update(
+        self,
+        *,
+        step_idx: int,
+        state: np.ndarray,
+        front_img: np.ndarray,
+        wrist_img: np.ndarray,
+        prompt: Optional[str],
+    ) -> None:
+        # cv2.imwrite expects BGR; if we converted to RGB for the model, swap back for correct colors.
+        front_bgr = front_img[..., ::-1] if self.bgr_to_rgb else front_img
+        wrist_bgr = wrist_img[..., ::-1] if self.bgr_to_rgb else wrist_img
+
+        try:
+            import cv2  # local import
+
+            cv2.imwrite(str(self.run_dir / "observation.image_front.png"), front_bgr)
+            cv2.imwrite(str(self.run_dir / "observation.image_wrist.png"), wrist_bgr)
+        except Exception as e:
+            print(f"[obs] warning: failed to save latest .png images (cv2 unavailable or write failed): {e}")
+
+        step_info = {
+            "step_idx": int(step_idx),
+            "prompt": prompt,
+            "state_shape": list(np.asarray(state).shape),
+            "front_shape": list(np.asarray(front_img).shape),
+            "wrist_shape": list(np.asarray(wrist_img).shape),
+        }
+        (self.run_dir / "step_latest.json").write_text(
+            json.dumps(step_info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        self._ensure_video_writers(front_bgr=front_bgr, wrist_bgr=wrist_bgr)
+        if self._front_writer is not None and self._wrist_writer is not None:
+            try:
+                self._front_writer.write(front_bgr)
+                self._wrist_writer.write(wrist_bgr)
+            except Exception as e:
+                print(f"[obs] warning: failed to append to video writers: {e}")
+
+    def finalize(self) -> None:
+        for w in (self._front_writer, self._wrist_writer):
+            if w is None:
+                continue
+            try:
+                w.release()
+            except Exception:
+                pass
 
 
 def _start_ssh_tunnels(cmds: list[str], *, startup_wait_s: float = 1.0) -> list[subprocess.Popen]:
@@ -392,23 +567,28 @@ def _wait_for_franka_not_resetting(
     raise TimeoutError(f"Timed out waiting for Franka to become not-resetting. Last status: {last}")
 
 
-def _run_franka_reset_all_and_wait(
+def _run_franka_reset_and_wait(
     franka: FrankaHttpClient,
     *,
+    reset_method: str,
     start_timeout_s: float,
     finish_timeout_s: float,
     poll_s: float,
     strict: bool,
 ) -> tuple[dict, bool]:
-    """Trigger /reset_all and wait until it is safe to proceed.
+    """Trigger a reset endpoint and wait until it is safe to proceed.
 
     We avoid sending anything to the model side until this returns.
 
-    If the robot is already at the reset pose, the server may finish very quickly and
-    we might never observe `resetting=True` via polling. In non-strict mode we treat
-    that as "already reset" and proceed.
+    Some resets may finish very quickly and we might never observe `resetting=True`
+    via polling. In non-strict mode we treat that as "already reset" and proceed.
     """
-    resp = franka.reset_all()
+    if reset_method == "jointreset":
+        resp = franka.joint_reset()
+    elif reset_method == "reset_all":
+        resp = franka.reset_all()
+    else:
+        raise ValueError(f"Unsupported reset_method={reset_method!r}")
 
     saw_resetting = False
     start_deadline = time.monotonic() + float(start_timeout_s)
@@ -427,7 +607,7 @@ def _run_franka_reset_all_and_wait(
     if strict:
         raise TimeoutError(
             f"Franka reset flag never became true within {start_timeout_s}s. "
-            f"Last status: {last}, reset_all response: {resp}"
+            f"Last status: {last}, reset response: {resp}"
         )
 
     return resp, False
@@ -485,12 +665,13 @@ async def run_loop(args: argparse.Namespace) -> None:
     front_cam = RealSenseColorCamera(front_serial, width=args.cam_width, height=args.cam_height, fps=args.cam_fps)
 
     print(f"[cams] wrist_serial={wrist_serial} front_serial={front_serial}")
-    save_obs_run_dir: Optional[Path] = None
+    save_obs_run: Optional[_ObsSaver] = None
 
     ping_interval = None if args.ws_ping_interval_s <= 0 else float(args.ws_ping_interval_s)
     ping_timeout = None if args.ws_ping_timeout_s <= 0 else float(args.ws_ping_timeout_s)
     close_timeout = float(args.ws_close_timeout_s)
 
+    control_mode: str = "cartesian"
     try:
         if args.ssh_tunnel:
             tunnel_procs = _start_ssh_tunnels(args.ssh_tunnel, startup_wait_s=args.ssh_tunnel_wait_s)
@@ -504,16 +685,17 @@ async def run_loop(args: argparse.Namespace) -> None:
             except Exception:
                 pass
 
-            print("[robot] reset_all starting...")
-            resp, saw_flag = _run_franka_reset_all_and_wait(
+            print(f"[robot] {args.reset_method} starting...")
+            resp, saw_flag = _run_franka_reset_and_wait(
                 franka,
+                reset_method=args.reset_method,
                 start_timeout_s=args.reset_start_timeout_s,
                 finish_timeout_s=args.reset_timeout_s,
                 poll_s=args.reset_poll_s,
                 strict=args.reset_strict,
             )
             if args.print_reset_status:
-                print(f"[robot] reset_all response: {resp} (observed_resetting_flag={saw_flag})")
+                print(f"[robot] {args.reset_method} response: {resp} (observed_resetting_flag={saw_flag})")
             # Extra short settle to make motion/audible behavior more apparent and avoid immediate follow-up commands.
             time.sleep(max(0.0, float(args.reset_settle_s)))
 
@@ -533,7 +715,12 @@ async def run_loop(args: argparse.Namespace) -> None:
                 )
                 print(f"[robot] reset_all done. delta_xyz_m={pos_err:.4f} delta_rot_rad={rot_err:.3f}")
             else:
-                print("[robot] reset_all done.")
+                print("[robot] reset done.")
+
+        if args.control_mode == "joint":
+            franka.start_joint_control()
+            control_mode = "joint"
+            print("[robot] control_mode=joint (streaming)")
 
         # IMPORTANT: OpenPI server-side inference may block its event loop (sync infer),
         # which can cause websocket keepalive ping timeouts. Default is to disable keepalive
@@ -562,6 +749,8 @@ async def run_loop(args: argparse.Namespace) -> None:
             period_s = 1.0 / max(args.hz, 1e-6)
             next_tick = time.monotonic()
             last_gripper_open: Optional[bool] = None
+            prev_quat_xyzw: Optional[np.ndarray] = None
+            warned_safe_rpy_ignored = False
 
             for step_idx in range(args.max_steps if args.max_steps > 0 else 1_000_000_000):
                 if stop_event.is_set():
@@ -572,10 +761,23 @@ async def run_loop(args: argparse.Namespace) -> None:
                 pose_xyzrpy = franka.get_pose_euler()
                 gripper_pos = franka.get_gripper_distance()
 
-                state14 = np.concatenate(
-                    [q, np.asarray([gripper_pos], dtype=np.float32), pose_xyzrpy.astype(np.float32)],
-                    axis=0,
-                ).astype(np.float32)
+                if args.state_format == "rpy14":
+                    state = np.concatenate(
+                        [q, np.asarray([gripper_pos], dtype=np.float32), pose_xyzrpy.astype(np.float32)],
+                        axis=0,
+                    ).astype(np.float32)
+                    state_spec = "float32[14] = [q(7), gripper(1), pose_xyzrpy(6)]"
+                elif args.state_format == "quat15":
+                    xyz = pose_xyzrpy[:3].astype(np.float32)
+                    rpy = pose_xyzrpy[3:].astype(np.float32)
+                    quat_xyzw = R.from_euler("xyz", rpy).as_quat().astype(np.float32)
+                    state = np.concatenate(
+                        [q, np.asarray([gripper_pos], dtype=np.float32), xyz, quat_xyzw],
+                        axis=0,
+                    ).astype(np.float32)
+                    state_spec = "float32[15] = [q(7), gripper(1), pose_xyzquat_xyzw(7)]"
+                else:
+                    raise ValueError(f"Unsupported --state_format={args.state_format!r}")
 
                 front_bgr = front_cam.read_bgr()
                 wrist_bgr = wrist_cam.read_bgr()
@@ -585,7 +787,7 @@ async def run_loop(args: argparse.Namespace) -> None:
                 wrist_img = _maybe_bgr_to_rgb(wrist_bgr, bgr_to_rgb=args.bgr_to_rgb)
 
                 obs: dict[str, Any] = {
-                    "observation.state": state14,
+                    "observation.state": state,
                     "observation.image_front": front_img,
                     "observation.image_wrist": wrist_img,
                 }
@@ -593,15 +795,16 @@ async def run_loop(args: argparse.Namespace) -> None:
                     obs["prompt"] = args.prompt
 
                 if args.print_obs_keys and step_idx == 0:
-                    print(f"[obs] keys={list(obs.keys())} state_shape={state14.shape} front={front_img.shape} wrist={wrist_img.shape}")
+                    print(f"[obs] keys={list(obs.keys())} state_shape={state.shape} front={front_img.shape} wrist={wrist_img.shape}")
 
-                save_obs_run_dir = _maybe_save_obs(
+                save_obs_run = _maybe_save_obs(
                     enabled=args.save_obs,
                     every=int(args.save_obs_every),
-                    run_dir=save_obs_run_dir,
+                    run=save_obs_run,
                     out_dir=args.save_obs_dir,
                     step_idx=step_idx,
-                    state14=state14,
+                    state=state,
+                    state_spec=state_spec,
                     front_img=front_img,
                     wrist_img=wrist_img,
                     front_serial=front_serial,
@@ -609,6 +812,7 @@ async def run_loop(args: argparse.Namespace) -> None:
                     bgr_to_rgb=args.bgr_to_rgb,
                     resize_hw=args.resize_hw,
                     prompt=args.prompt,
+                    video_fps=max(1.0, float(args.hz) / max(1, int(args.exec_horizon)) / max(1, int(args.save_obs_every))),
                 )
 
                 await ws.send(packer.pack(obs))
@@ -625,11 +829,11 @@ async def run_loop(args: argparse.Namespace) -> None:
                     raise RuntimeError(f"OpenPI server returned error text:\n{resp_msg}")
                 action_dict = mpn.unpackb(resp_msg)
 
-                action_seq = _extract_action(action_dict, action_key=args.action_key)  # (T, 7)
+                action_seq = _extract_action(action_dict, action_key=args.action_key)  # (T, D), D in {7,8,15}
 
-                if step_idx == 0 or (args.print_actions_every > 0 and (step_idx % args.print_actions_every == 0)):
-                    waited_ms = (time.monotonic() - t0) * 1000.0
-                    print(f"[step {step_idx}] action0={action_seq[0].tolist()} action_T={int(action_seq.shape[0])} step_ms={waited_ms:.1f}")
+                
+                waited_ms = (time.monotonic() - t0) * 1000.0
+                print(f"[step {step_idx}] action0={action_seq[0].tolist()} action_T={int(action_seq.shape[0])} step_ms={waited_ms:.1f}")
 
                 # Execute multiple steps for each inference result (open-loop).
                 exec_horizon = int(args.exec_horizon)
@@ -640,24 +844,65 @@ async def run_loop(args: argparse.Namespace) -> None:
                     if stop_event.is_set():
                         break
                     a7 = action_seq[min(k, action_seq.shape[0] - 1)]
-                    target_pose_xyzrpy = a7[:6]
-                    target_gripper = float(a7[6])
+                    (
+                        target_xyz,
+                        target_rpy,
+                        target_quat_xyzw,
+                        target_gripper,
+                        _ignored_joints7,
+                        prev_quat_xyzw,
+                    ) = _parse_action_step(
+                        a7,
+                        action_format=args.action_format,
+                        quat_normalize=args.quat_normalize,
+                        quat_flip_sign=args.quat_flip_sign,
+                        prev_quat_xyzw=prev_quat_xyzw,
+                    )
 
-                    if args.safe_xyz_low is not None and args.safe_xyz_high is not None:
-                        xyz = target_pose_xyzrpy[:3].copy()
+                    joints7 = _ignored_joints7
+                    if args.control_mode == "auto":
+                        want_mode = "joint" if joints7 is not None else "cartesian"
+                    else:
+                        want_mode = args.control_mode
+
+                    if want_mode == "joint" and joints7 is None:
+                        raise RuntimeError(
+                            "Joint control requested but action does not include joints. "
+                            "Use --control_mode cartesian or ensure model returns joint actions "
+                            "(either 8D joint8=[joints(7),gripper] or 15D quat15=[joints,gripper,xyz,quat])."
+                        )
+
+                    if want_mode != control_mode:
+                        if want_mode == "joint":
+                            franka.start_joint_control()
+                            control_mode = "joint"
+                            print("[robot] switched to joint control")
+                        elif want_mode == "cartesian":
+                            franka.stop_joint_control()
+                            control_mode = "cartesian"
+                            print("[robot] switched to cartesian control")
+                        else:
+                            raise ValueError(f"Unsupported --control_mode={args.control_mode!r}")
+
+                    if control_mode == "cartesian" and args.safe_xyz_low is not None and args.safe_xyz_high is not None:
+                        xyz = target_xyz[:3].copy()
                         clipped = np.clip(xyz, args.safe_xyz_low, args.safe_xyz_high)
                         if args.stop_on_safety_violation and not np.allclose(xyz, clipped):
                             raise RuntimeError(f"Target xyz out of safety bounds: xyz={xyz.tolist()} clipped={clipped.tolist()}")
-                        target_pose_xyzrpy = target_pose_xyzrpy.copy()
-                        target_pose_xyzrpy[:3] = clipped
+                        target_xyz = target_xyz.copy()
+                        target_xyz[:3] = clipped
 
-                    if args.safe_rpy_low is not None and args.safe_rpy_high is not None:
-                        rpy = target_pose_xyzrpy[3:].copy()
-                        clipped = np.clip(rpy, args.safe_rpy_low, args.safe_rpy_high)
-                        if args.stop_on_safety_violation and not np.allclose(rpy, clipped):
-                            raise RuntimeError(f"Target rpy out of safety bounds: rpy={rpy.tolist()} clipped={clipped.tolist()}")
-                        target_pose_xyzrpy = target_pose_xyzrpy.copy()
-                        target_pose_xyzrpy[3:] = clipped
+                    if control_mode == "cartesian" and args.safe_rpy_low is not None and args.safe_rpy_high is not None:
+                        if target_rpy is None:
+                            if not warned_safe_rpy_ignored:
+                                print("[warn] safe_rpy_* bounds are set but quaternion actions are in use; rpy bounds are ignored.")
+                                warned_safe_rpy_ignored = True
+                        else:
+                            rpy = target_rpy.copy()
+                            clipped = np.clip(rpy, args.safe_rpy_low, args.safe_rpy_high)
+                            if args.stop_on_safety_violation and not np.allclose(rpy, clipped):
+                                raise RuntimeError(f"Target rpy out of safety bounds: rpy={rpy.tolist()} clipped={clipped.tolist()}")
+                            target_rpy = clipped.astype(np.float32)
 
                     if args.dry_run:
                         next_tick += period_s
@@ -670,7 +915,16 @@ async def run_loop(args: argparse.Namespace) -> None:
 
                     if args.recover_each_step:
                         franka.clear_errors()
-                    franka.send_pose_xyzrpy(target_pose_xyzrpy)
+                    if control_mode == "joint":
+                        franka.send_joint_q(joints7)
+                    elif target_quat_xyzw is not None:
+                        franka.send_pose_xyz_quat(
+                            np.concatenate([target_xyz.astype(np.float32), target_quat_xyzw], axis=0)
+                        )
+                    else:
+                        if target_rpy is None:
+                            raise AssertionError("Expected target_rpy for non-quaternion action")
+                        franka.send_pose_xyzrpy(np.concatenate([target_xyz.astype(np.float32), target_rpy.astype(np.float32)], axis=0))
 
                     want_open = target_gripper >= args.gripper_open_threshold
                     if last_gripper_open is None or (want_open != last_gripper_open):
@@ -693,6 +947,17 @@ async def run_loop(args: argparse.Namespace) -> None:
                     print(f"[timing] step_ms={total_ms:.1f} server_timing={timing}")
 
     finally:
+        if save_obs_run is not None:
+            try:
+                save_obs_run.finalize()
+            except Exception:
+                pass
+        if args.on_stop == "hold" and control_mode == "joint":
+            try:
+                franka.stop_joint_control()
+                control_mode = "cartesian"
+            except Exception:
+                pass
         if args.on_stop == "hold":
             try:
                 pose_xyzrpy = franka.get_pose_euler()
@@ -731,6 +996,33 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--prompt", default=None, help="Optional text prompt for the policy")
     p.add_argument("--action_key", default="actions", help="Key in OpenPI response dict containing actions (default: actions)")
+    p.add_argument(
+        "--state_format",
+        choices=["rpy14", "quat15"],
+        default="rpy14",
+        help="Observation state encoding: rpy14=[q,gripper,xyzrpy], quat15=[q,gripper,xyz,quat_xyzw].",
+    )
+    p.add_argument(
+        "--action_format",
+        choices=["auto", "rpy7", "quat8", "quat15", "joint8"],
+        default="auto",
+        help=(
+            "Action encoding: auto infers from dim; rpy7=[xyzrpy,gripper]; quat8=[xyz,quat_xyzw,gripper]; "
+            "quat15=[joints,gripper,xyz,quat_xyzw]; joint8=[joints(7),gripper]."
+        ),
+    )
+    p.add_argument(
+        "--quat_normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize quaternion actions to unit length (recommended).",
+    )
+    p.add_argument(
+        "--quat_flip_sign",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Flip quaternion sign for continuity (if dot(prev, curr)<0).",
+    )
 
     p.add_argument("--hz", type=float, default=10.0, help="Control loop frequency")
     p.add_argument("--exec_horizon", type=int, default=50, help="Execute N action steps per inference result")
@@ -738,6 +1030,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dry_run", action="store_true", help="Do not command robot; just print actions")
     p.add_argument("--recover_each_step", action="store_true", help="Call /clearerr before each /pose command")
     p.add_argument("--franka_timeout_s", type=float, default=3.0)
+    p.add_argument(
+        "--control_mode",
+        choices=["cartesian", "joint", "auto"],
+        default="cartesian",
+        help=(
+            "Robot command mode: cartesian sends /pose; joint sends /joint_q (requires 15D actions with joints). "
+            "auto uses joint when joints are present, else cartesian."
+        ),
+    )
 
     p.add_argument("--gripper_open_threshold", type=float, default=0.7, help="Open if action gripper >= threshold, else close")
 
@@ -766,12 +1067,18 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Reset robot once before starting inference (default: enabled).",
     )
+    p.add_argument(
+        "--reset_method",
+        choices=["jointreset", "reset_all"],
+        default="jointreset",
+        help="Reset endpoint to call before inference.",
+    )
     p.add_argument("--reset_strict", action="store_true", help="Fail if /status.resetting is never observed true during reset")
-    p.add_argument("--reset_start_timeout_s", type=float, default=2.0, help="Seconds to wait for /status.resetting to become true after reset_all")
-    p.add_argument("--reset_timeout_s", type=float, default=20.0, help="Max seconds to wait for reset to finish")
+    p.add_argument("--reset_start_timeout_s", type=float, default=2.0, help="Seconds to wait for /status.resetting to become true after reset")
+    p.add_argument("--reset_timeout_s", type=float, default=60.0, help="Max seconds to wait for reset to finish")
     p.add_argument("--reset_poll_s", type=float, default=0.2, help="Polling interval while waiting for reset")
     p.add_argument("--reset_settle_s", type=float, default=0.5, help="Extra seconds to wait after reset completes")
-    p.add_argument("--print_reset_status", action="store_true", help="Print /reset_all response and observed resetting flag")
+    p.add_argument("--print_reset_status", action="store_true", help="Print reset endpoint response and observed resetting flag")
 
     p.add_argument("--ws_ping_interval_s", type=float, default=0.0, help="Websocket keepalive ping interval in seconds (0 disables)")
     p.add_argument("--ws_ping_timeout_s", type=float, default=0.0, help="Websocket keepalive ping timeout in seconds (0 disables)")

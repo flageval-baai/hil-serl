@@ -367,7 +367,9 @@ def main(_):
 
     rospy.wait_for_service('/franka_control/set_load')
     set_load_service = rospy.ServiceProxy('/franka_control/set_load', SetLoad)
-    gripper_lock = threading.RLock()
+
+    # Lock to prevent concurrent gripper commands
+    gripper_command_lock = threading.Lock()
 
     def _busy(action: str):
         return jsonify(
@@ -380,14 +382,36 @@ def main(_):
         )
 
     def _get_gripper_position() -> float:
+        """Get current gripper position (non-blocking).
+
+        For pyrobotiqgripper, this reads from the cached paramDic which is
+        updated during gripper operations, allowing real-time position reads
+        even while the gripper is moving.
+        """
         if gripper_server is None:
             return 0.0
-        with gripper_lock:
+        try:
             pos = getattr(gripper_server, "gripper_pos", 0.0)
+            return float(pos)
+        except Exception:
+            return 0.0
+
+    def _start_gripper_command_async(command_fn, *args, **kwargs) -> bool:
+        """
+        Start a gripper command in a background thread.
+        Returns True if the command was started, False if another command is running.
+        """
+        if not gripper_command_lock.acquire(blocking=False):
+            return False  # Another command is already running
+
+        def _job():
             try:
-                return float(pos)
-            except Exception:
-                return 0.0
+                command_fn(*args, **kwargs)
+            finally:
+                gripper_command_lock.release()
+
+        threading.Thread(target=_job, name="gripper_command", daemon=True).start()
+        return True
 
 
     # Route for Setting Load
@@ -489,8 +513,8 @@ def main(_):
             return jsonify({"ok": False, "error": "No gripper configured"}), 400
         if robot_server.is_resetting():
             return _busy("activate_gripper")
-        with gripper_lock:
-            gripper_server.activate_gripper()
+        if not _start_gripper_command_async(gripper_server.activate_gripper):
+            return _busy("activate_gripper")
         return jsonify({"ok": True})
 
     # Route for Resetting the Gripper. It will reset and activate the gripper
@@ -501,8 +525,8 @@ def main(_):
             return jsonify({"ok": False, "error": "No gripper configured"}), 400
         if robot_server.is_resetting():
             return _busy("reset_gripper")
-        with gripper_lock:
-            gripper_server.reset_gripper()
+        if not _start_gripper_command_async(gripper_server.reset_gripper):
+            return _busy("reset_gripper")
         return jsonify({"ok": True})
 
     # Route for Opening the Gripper
@@ -513,8 +537,8 @@ def main(_):
             return jsonify({"ok": False, "error": "No gripper configured"}), 400
         if robot_server.is_resetting():
             return _busy("open_gripper")
-        with gripper_lock:
-            gripper_server.open()
+        if not _start_gripper_command_async(gripper_server.open):
+            return _busy("open_gripper")
         return jsonify({"ok": True})
 
     # Route for Closing the Gripper
@@ -525,8 +549,8 @@ def main(_):
             return jsonify({"ok": False, "error": "No gripper configured"}), 400
         if robot_server.is_resetting():
             return _busy("close_gripper")
-        with gripper_lock:
-            gripper_server.close()
+        if not _start_gripper_command_async(gripper_server.close):
+            return _busy("close_gripper")
         return jsonify({"ok": True})
 
     # Route for Closing the Gripper
@@ -537,8 +561,8 @@ def main(_):
             return jsonify({"ok": False, "error": "No gripper configured"}), 400
         if robot_server.is_resetting():
             return _busy("close_gripper_slow")
-        with gripper_lock:
-            gripper_server.close_slow()
+        if not _start_gripper_command_async(gripper_server.close_slow):
+            return _busy("close_gripper_slow")
         return jsonify({"ok": True})
 
     # Route for moving the gripper
@@ -551,8 +575,8 @@ def main(_):
         gripper_pos = request.json
         pos = np.clip(int(gripper_pos["gripper_pos"]), 0, 255)  # 0-255
         print(f"move gripper to {pos}")
-        with gripper_lock:
-            gripper_server.move(pos)
+        if not _start_gripper_command_async(gripper_server.move, pos):
+            return _busy("move_gripper")
         return jsonify({"ok": True})
 
     # Route for Clearing Errors (Communcation constraints, etc.)
@@ -627,8 +651,7 @@ def main(_):
         if not started:
             return _busy("reset_all")
         if gripper_server is not None:
-            with gripper_lock:
-                gripper_server.open()
+            _start_gripper_command_async(gripper_server.open)
         return jsonify({"ok": True, "started": True})
 
     webapp.run(host=FLAGS.flask_url, threaded=True)

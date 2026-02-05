@@ -372,37 +372,23 @@ def main(_):
     gripper_command_lock = threading.Lock()
 
     def _busy(action: str):
-        return jsonify(
-            {
-                "ok": False,
-                "busy": True,
-                "action": action,
-                "resetting": robot_server.is_resetting(),
-            }
-        )
+        return jsonify({
+            "ok": False,
+            "busy": True,
+            "action": action,
+            "resetting": robot_server.is_resetting(),
+        })
 
     def _get_gripper_position() -> float:
-        """Get current gripper position (non-blocking).
-
-        For pyrobotiqgripper, this reads from the cached paramDic which is
-        updated during gripper operations, allowing real-time position reads
-        even while the gripper is moving.
-        """
+        """Get current gripper position (non-blocking)."""
         if gripper_server is None:
             return 0.0
-        try:
-            pos = getattr(gripper_server, "gripper_pos", 0.0)
-            return float(pos)
-        except Exception:
-            return 0.0
+        return float(getattr(gripper_server, "gripper_pos", 0.0))
 
     def _start_gripper_command_async(command_fn, *args, **kwargs) -> bool:
-        """
-        Start a gripper command in a background thread.
-        Returns True if the command was started, False if another command is running.
-        """
+        """Start a gripper command in a background thread. Returns False if busy."""
         if not gripper_command_lock.acquire(blocking=False):
-            return False  # Another command is already running
+            return False
 
         def _job():
             try:
@@ -412,6 +398,17 @@ def main(_):
 
         threading.Thread(target=_job, name="gripper_command", daemon=True).start()
         return True
+
+    def _gripper_route(action: str, method_name: str, *args):
+        """Helper for gripper routes - handles common checks and async execution."""
+        if gripper_server is None:
+            return jsonify({"ok": False, "error": "No gripper configured"}), 400
+        if robot_server.is_resetting():
+            return _busy(action)
+        command_fn = getattr(gripper_server, method_name)
+        if not _start_gripper_command_async(command_fn, *args):
+            return _busy(action)
+        return jsonify({"ok": True})
 
 
     # Route for Setting Load
@@ -505,79 +502,36 @@ def main(_):
             return _busy("jointreset")
         return jsonify({"ok": True, "started": True})
 
-    # Route for Activating the Gripper
     @webapp.route("/activate_gripper", methods=["POST"])
     def activate_gripper():
         print("activate gripper")
-        if gripper_server is None:
-            return jsonify({"ok": False, "error": "No gripper configured"}), 400
-        if robot_server.is_resetting():
-            return _busy("activate_gripper")
-        if not _start_gripper_command_async(gripper_server.activate_gripper):
-            return _busy("activate_gripper")
-        return jsonify({"ok": True})
+        return _gripper_route("activate_gripper", "activate_gripper")
 
-    # Route for Resetting the Gripper. It will reset and activate the gripper
     @webapp.route("/reset_gripper", methods=["POST"])
     def reset_gripper():
         print("reset gripper")
-        if gripper_server is None:
-            return jsonify({"ok": False, "error": "No gripper configured"}), 400
-        if robot_server.is_resetting():
-            return _busy("reset_gripper")
-        if not _start_gripper_command_async(gripper_server.reset_gripper):
-            return _busy("reset_gripper")
-        return jsonify({"ok": True})
+        return _gripper_route("reset_gripper", "reset_gripper")
 
-    # Route for Opening the Gripper
     @webapp.route("/open_gripper", methods=["POST"])
-    def open():
-        print("open")
-        if gripper_server is None:
-            return jsonify({"ok": False, "error": "No gripper configured"}), 400
-        if robot_server.is_resetting():
-            return _busy("open_gripper")
-        if not _start_gripper_command_async(gripper_server.open):
-            return _busy("open_gripper")
-        return jsonify({"ok": True})
+    def open_gripper():
+        print("open gripper")
+        return _gripper_route("open_gripper", "open")
 
-    # Route for Closing the Gripper
     @webapp.route("/close_gripper", methods=["POST"])
-    def close():
-        print("close")
-        if gripper_server is None:
-            return jsonify({"ok": False, "error": "No gripper configured"}), 400
-        if robot_server.is_resetting():
-            return _busy("close_gripper")
-        if not _start_gripper_command_async(gripper_server.close):
-            return _busy("close_gripper")
-        return jsonify({"ok": True})
+    def close_gripper():
+        print("close gripper")
+        return _gripper_route("close_gripper", "close")
 
-    # Route for Closing the Gripper
     @webapp.route("/close_gripper_slow", methods=["POST"])
-    def close_slow():
-        print("close")
-        if gripper_server is None:
-            return jsonify({"ok": False, "error": "No gripper configured"}), 400
-        if robot_server.is_resetting():
-            return _busy("close_gripper_slow")
-        if not _start_gripper_command_async(gripper_server.close_slow):
-            return _busy("close_gripper_slow")
-        return jsonify({"ok": True})
+    def close_gripper_slow():
+        print("close gripper slow")
+        return _gripper_route("close_gripper_slow", "close_slow")
 
-    # Route for moving the gripper
     @webapp.route("/move_gripper", methods=["POST"])
     def move_gripper():
-        if gripper_server is None:
-            return jsonify({"ok": False, "error": "No gripper configured"}), 400
-        if robot_server.is_resetting():
-            return _busy("move_gripper")
-        gripper_pos = request.json
-        pos = np.clip(int(gripper_pos["gripper_pos"]), 0, 255)  # 0-255
+        pos = np.clip(int(request.json["gripper_pos"]), 0, 255)
         print(f"move gripper to {pos}")
-        if not _start_gripper_command_async(gripper_server.move, pos):
-            return _busy("move_gripper")
-        return jsonify({"ok": True})
+        return _gripper_route("move_gripper", "move", pos)
 
     # Route for Clearing Errors (Communcation constraints, etc.)
     @webapp.route("/clearerr", methods=["POST"])

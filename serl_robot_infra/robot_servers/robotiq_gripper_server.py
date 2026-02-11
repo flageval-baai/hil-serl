@@ -59,6 +59,7 @@ class RobotiqGripperServer(GripperServer):
     def _update_gripper(self, msg):
         """internal callback to get the latest gripper position."""
         self.gripper_pos = 1 - msg.gPO / 255
+        self.gripper_pos_d = 1 - msg.gPR / 255  # position request echo from hardware
 
     def _generate_gripper_command(self, char, command):
         """Update the gripper command according to the character entered by the user."""

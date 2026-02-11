@@ -66,6 +66,8 @@ class FrankaServer:
             self.q = np.zeros((7,), dtype=np.float64)
             self.dq = np.zeros((7,), dtype=np.float64)
             self.jacobian = np.zeros((6, 7), dtype=np.float64)
+            self.q_d = np.zeros((7,), dtype=np.float64)    # desired joint positions
+            self.pos_d = np.zeros((7,), dtype=np.float64)  # desired EE pose [x,y,z,qx,qy,qz,qw]
 
         self.eepub = rospy.Publisher(
             "/cartesian_impedance_controller/equilibrium_pose",
@@ -281,6 +283,8 @@ class FrankaServer:
                 "q": np.array(self.q, copy=True),
                 "dq": np.array(self.dq, copy=True),
                 "jacobian": np.array(self.jacobian, copy=True),
+                "q_d": np.array(self.q_d, copy=True),
+                "pose_d": np.array(self.pos_d, copy=True),
             }
 
     def _set_currpos(self, msg):
@@ -291,12 +295,18 @@ class FrankaServer:
         q = np.array(list(msg.q)).reshape((7,))
         force = np.array(list(msg.K_F_ext_hat_K)[:3])
         torque = np.array(list(msg.K_F_ext_hat_K)[3:])
+        q_d = np.array(list(msg.q_d)).reshape((7,))
+        tmatrix_d = np.array(list(msg.O_T_EE_d)).reshape(4, 4).T
+        r_d = R.from_matrix(tmatrix_d[:3, :3])
+        pose_d = np.concatenate([tmatrix_d[:3, -1], r_d.as_quat()])
         with self._state_lock:
             self.pos = pose
             self.dq = dq
             self.q = q
             self.force = force
             self.torque = torque
+            self.q_d = q_d
+            self.pos_d = pose_d
             try:
                 self.vel = self.jacobian @ self.dq
             except Exception:
@@ -384,6 +394,17 @@ def main(_):
         if gripper_server is None:
             return 0.0
         return float(getattr(gripper_server, "gripper_pos", 0.0))
+
+    def _get_gripper_desired_position() -> float:
+        """Get desired gripper position from hardware register (gPR).
+        Falls back to actual position if not available."""
+        if gripper_server is None:
+            return 0.0
+        pos_d = getattr(gripper_server, "gripper_pos_d", None)
+        if pos_d is None:
+            return _get_gripper_position()
+        return float(pos_d)
+
 
     def _start_gripper_command_async(command_fn, *args, **kwargs) -> bool:
         """Start a gripper command in a background thread. Returns False if busy."""
@@ -479,6 +500,19 @@ def main(_):
         robot_server.wait_for_state(timeout_s=2.0)
         return jsonify({"q": robot_server.get_state_copy()["q"].tolist()})
 
+    @webapp.route("/getq_d", methods=["POST"])
+    def get_q_d():
+        robot_server.wait_for_state(timeout_s=2.0)
+        return jsonify({"q_d": robot_server.get_state_copy()["q_d"].tolist()})
+
+    @webapp.route("/getpos_euler_d", methods=["POST"])
+    def get_pos_euler_d():
+        robot_server.wait_for_state(timeout_s=2.0)
+        state = robot_server.get_state_copy()
+        xyz = state["pose_d"][:3]
+        r = R.from_quat(state["pose_d"][3:]).as_euler("xyz")
+        return jsonify({"pose_d": np.concatenate([xyz, r]).tolist()})
+
     @webapp.route("/getdq", methods=["POST"])
     def get_dq():
         robot_server.wait_for_state(timeout_s=2.0)
@@ -567,6 +601,16 @@ def main(_):
                 "dq": state["dq"].tolist(),
                 "jacobian": state["jacobian"].tolist(),
                 "gripper_pos": _get_gripper_position(),
+                "gripper_pos_d": _get_gripper_desired_position(),
+                "pose_euler": np.concatenate([
+                    state["pose"][:3],
+                    R.from_quat(state["pose"][3:]).as_euler("xyz"),
+                ]).tolist(),
+                "q_d": state["q_d"].tolist(),
+                "pose_euler_d": np.concatenate([
+                    state["pose_d"][:3],
+                    R.from_quat(state["pose_d"][3:]).as_euler("xyz"),
+                ]).tolist(),
             }
         )
 

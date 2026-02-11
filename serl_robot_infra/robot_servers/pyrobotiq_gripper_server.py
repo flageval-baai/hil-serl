@@ -5,17 +5,31 @@ import threading
 class RobotiqGripperServer(RobotiqGripper):
     """Thread-safe Robotiq gripper server with real-time position tracking."""
 
+    # Physical register limits (measure per gripper unit)
+    GPO_OPEN = 3      # gPO when fully open
+    GPO_CLOSED = 230   # gPO when fully closed (no object)
+
     def __init__(self):
         super().__init__()
         self._serial_lock = threading.RLock()
         self._cached_gripper_pos = 0.0
+        self.gripper_pos_d = None  # desired position; None = use gripper_pos
+
+    def _normalize(self, raw):
+        """Map raw register value to [0, 1]: 0=closed, 1=open, clipped."""
+        return max(0.0, min(1.0,
+            (self.GPO_CLOSED - raw) / (self.GPO_CLOSED - self.GPO_OPEN)
+        ))
 
     def readAll(self):
         """Override to update cached position after every read."""
         super().readAll()
         gPO = self.paramDic.get("gPO")
         if gPO is not None:
-            self._cached_gripper_pos = 1 - gPO / 255
+            self._cached_gripper_pos = self._normalize(gPO)
+        gPR = self.paramDic.get("gPR")
+        if gPR is not None:
+            self.gripper_pos_d = 1 - gPR / 255
 
     @property
     def gripper_pos(self):

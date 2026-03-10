@@ -16,7 +16,7 @@ from typing import Optional
 
 from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
 from franka_msgs.srv import SetLoad
-from serl_franka_controllers.msg import ZeroJacobian
+from serl_franka_controllers.msg import ZeroJacobian, DesiredState
 import geometry_msgs.msg as geom_msg
 from dynamic_reconfigure.client import Client as ReconfClient
 
@@ -68,6 +68,11 @@ class FrankaServer:
             self.jacobian = np.zeros((6, 7), dtype=np.float64)
             self.q_d = np.zeros((7,), dtype=np.float64)    # desired joint positions
             self.pos_d = np.zeros((7,), dtype=np.float64)  # desired EE pose [x,y,z,qx,qy,qz,qw]
+            # Unwrapped Euler angles (continuous, no 2π jumps)
+            self._euler = np.zeros(3, dtype=np.float64)
+            self._euler_d = np.zeros(3, dtype=np.float64)
+            self._euler_init = False
+            self._euler_d_init = False
 
         self.eepub = rospy.Publisher(
             "/cartesian_impedance_controller/equilibrium_pose",
@@ -82,10 +87,22 @@ class FrankaServer:
             ZeroJacobian,
             self._set_jacobian,
         )
+        self.desired_state_sub = rospy.Subscriber(
+            "/cartesian_impedance_controller/desired_state",
+            DesiredState,
+            self._set_desired_state,
+        )
         time.sleep(1)
         self.state_sub = rospy.Subscriber(
             "franka_state_controller/franka_states", FrankaState, self._set_currpos
         )
+
+    @staticmethod
+    def _unwrap_euler(new_euler, prev_euler):
+        """Unwrap Euler angles to maintain continuity with previous values.
+        Adjusts new_euler by multiples of 2π so it's closest to prev_euler."""
+        diff = new_euler - prev_euler
+        return prev_euler + (diff - np.round(diff / (2 * np.pi)) * (2 * np.pi))
 
     @contextmanager
     def _try_command(self):
@@ -285,28 +302,30 @@ class FrankaServer:
                 "jacobian": np.array(self.jacobian, copy=True),
                 "q_d": np.array(self.q_d, copy=True),
                 "pose_d": np.array(self.pos_d, copy=True),
+                "euler": np.array(self._euler, copy=True),
+                "euler_d": np.array(self._euler_d, copy=True),
             }
 
     def _set_currpos(self, msg):
         tmatrix = np.array(list(msg.O_T_EE)).reshape(4, 4).T
         r = R.from_matrix(tmatrix[:3, :3])
         pose = np.concatenate([tmatrix[:3, -1], r.as_quat()])
+        euler = r.as_euler("xyz")
         dq = np.array(list(msg.dq)).reshape((7,))
         q = np.array(list(msg.q)).reshape((7,))
         force = np.array(list(msg.K_F_ext_hat_K)[:3])
         torque = np.array(list(msg.K_F_ext_hat_K)[3:])
-        q_d = np.array(list(msg.q_d)).reshape((7,))
-        tmatrix_d = np.array(list(msg.O_T_EE_d)).reshape(4, 4).T
-        r_d = R.from_matrix(tmatrix_d[:3, :3])
-        pose_d = np.concatenate([tmatrix_d[:3, -1], r_d.as_quat()])
         with self._state_lock:
             self.pos = pose
+            if self._euler_init:
+                self._euler = self._unwrap_euler(euler, self._euler)
+            else:
+                self._euler = euler
+                self._euler_init = True
             self.dq = dq
             self.q = q
             self.force = force
             self.torque = torque
-            self.q_d = q_d
-            self.pos_d = pose_d
             try:
                 self.vel = self.jacobian @ self.dq
             except Exception:
@@ -320,6 +339,19 @@ class FrankaServer:
         jacobian = np.array(list(msg.zero_jacobian)).reshape((6, 7), order="F")
         with self._state_lock:
             self.jacobian = jacobian
+
+    def _set_desired_state(self, msg):
+        q_d = np.array(list(msg.q_d)).reshape((7,))
+        pose_d = np.array(list(msg.pose_d)).reshape((7,))
+        euler_d = R.from_quat(pose_d[3:]).as_euler("xyz")
+        with self._state_lock:
+            self.q_d = q_d
+            self.pos_d = pose_d
+            if self._euler_d_init:
+                self._euler_d = self._unwrap_euler(euler_d, self._euler_d)
+            else:
+                self._euler_d = euler_d
+                self._euler_d_init = True
 
 
 ###############################################################################
@@ -471,8 +503,7 @@ def main(_):
         robot_server.wait_for_state(timeout_s=2.0)
         state = robot_server.get_state_copy()
         xyz = state["pose"][:3]
-        r = R.from_quat(state["pose"][3:]).as_euler("xyz")
-        return jsonify({"pose": np.concatenate([xyz, r]).tolist()})
+        return jsonify({"pose": np.concatenate([xyz, state["euler"]]).tolist()})
 
     # Route for Getting Pose
     @webapp.route("/getpos", methods=["POST"])
@@ -510,8 +541,7 @@ def main(_):
         robot_server.wait_for_state(timeout_s=2.0)
         state = robot_server.get_state_copy()
         xyz = state["pose_d"][:3]
-        r = R.from_quat(state["pose_d"][3:]).as_euler("xyz")
-        return jsonify({"pose_d": np.concatenate([xyz, r]).tolist()})
+        return jsonify({"pose_d": np.concatenate([xyz, state["euler_d"]]).tolist()})
 
     @webapp.route("/getdq", methods=["POST"])
     def get_dq():
@@ -604,12 +634,12 @@ def main(_):
                 "gripper_pos_d": _get_gripper_desired_position(),
                 "pose_euler": np.concatenate([
                     state["pose"][:3],
-                    R.from_quat(state["pose"][3:]).as_euler("xyz"),
+                    state["euler"],
                 ]).tolist(),
                 "q_d": state["q_d"].tolist(),
                 "pose_euler_d": np.concatenate([
                     state["pose_d"][:3],
-                    R.from_quat(state["pose_d"][3:]).as_euler("xyz"),
+                    state["euler_d"],
                 ]).tolist(),
             }
         )

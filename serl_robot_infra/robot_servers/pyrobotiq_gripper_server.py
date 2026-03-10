@@ -13,7 +13,7 @@ class RobotiqGripperServer(RobotiqGripper):
         super().__init__()
         self._serial_lock = threading.RLock()
         self._cached_gripper_pos = 0.0
-        self.gripper_pos_d = None  # desired position; None = use gripper_pos
+        self.gripper_pos_d = None  # None → fall back to gripper_pos
 
     def _normalize(self, raw):
         """Map raw register value to [0, 1]: 0=closed, 1=open, clipped."""
@@ -27,9 +27,12 @@ class RobotiqGripperServer(RobotiqGripper):
         gPO = self.paramDic.get("gPO")
         if gPO is not None:
             self._cached_gripper_pos = self._normalize(gPO)
-        gPR = self.paramDic.get("gPR")
-        if gPR is not None:
-            self.gripper_pos_d = 1 - gPR / 255
+            # Track gripper_pos_d from gPO (actual position), not gPR.
+            # gPR is unreliable because _autoConnect() contaminates it
+            # with rPR=100 and readAll() uses FC3 instead of FC4.
+            # During goTo() blocking calls, the internal polling loop
+            # calls readAll() continuously, keeping this value current.
+            self.gripper_pos_d = self._cached_gripper_pos
 
     @property
     def gripper_pos(self):

@@ -36,10 +36,15 @@ def extract_eef_pose_and_gripper(action: List[float]) -> tuple:
     Returns:
         (eef_pose_quat, gripper_value): 7D pose with quaternion and gripper value
     """
-    gripper = action[7]
-    xyz = action[8:11]
-    rpy = action[11:14]
-
+    if len(action) == 14:
+        gripper = action[7]
+        xyz = action[8:11]
+        rpy = action[11:14]
+    elif len(action) == 7:
+        # If action is already in EEF format, just extract gripper and pose
+        gripper = action[6]
+        xyz = action[0:3]
+        rpy = action[3:6]
     # Convert RPY to quaternion
     quat = euler_2_quat(np.array(rpy))
 
@@ -107,10 +112,10 @@ def replay_actions_json(
 
     for i, frame in enumerate(frames_to_play):
         action = frame.get("action", [])
-
-        if len(action) < 14:
-            print(f"[WARN] Frame {i}: action has {len(action)} dims, expected 14. Skipping.")
-            continue
+        assert len(action) in [7, 14], f"Frame {i}: Expected action length 7 or 14, got {len(action)}"
+        # if len(action) < 14:
+        #     print(f"[WARN] Frame {i}: action has {len(action)} dims, expected 14. Skipping.")
+        #     continue
 
         # Extract EEF pose and gripper
         eef_pose_quat, gripper_value = extract_eef_pose_and_gripper(action)
@@ -130,8 +135,12 @@ def replay_actions_json(
 
         # Print progress
         frame_idx = frame.get("frame_index", start_frame + i)
-        xyz = action[8:11]
-        rpy = action[11:14]
+        if len(action) == 14:
+            xyz = action[8:11]
+            rpy = action[11:14]
+        else:
+            xyz = action[0:3]
+            rpy = action[3:6]
         print(
             f"Frame {i+1}/{num_frames} (idx={frame_idx}) | "
             f"XYZ=[{xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}] | "

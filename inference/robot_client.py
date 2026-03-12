@@ -122,17 +122,65 @@ class RobotClient:
         except requests.exceptions.RequestException as e:
             print(f"[WARN] pose request failed: {e}")
 
-    def goto_pose_euler(self, pose_euler: Sequence[float]) -> None:
-        """Send EEF pose command with euler angles.
+    def goto_joints(self, joints: Sequence[float]) -> None:
+        """Send joint position command.
 
         Args:
-            pose_euler: 6D pose [x, y, z, roll, pitch, yaw]
+            joints: 7D joint positions [q1, q2, q3, q4, q5, q6, q7]
         """
-        xyz = np.array(pose_euler[:3])
-        rpy = np.array(pose_euler[3:6])
-        quat = euler_2_quat(rpy)
-        pose_quat = np.concatenate([xyz, quat])
-        self.goto_pose(pose_quat.tolist())
+        url = f"{self.server_url}/joints"
+        message = {"arr": list(joints)}
+        try:
+            requests.post(url, json=message, timeout=self.timeout)
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] joints request failed: {e}")
+
+    def get_control_mode(self) -> str:
+        """Get current control mode from the server.
+
+        Returns:
+            "eef" or "joint"
+        """
+        url = f"{self.server_url}/status"
+        try:
+            resp = requests.post(url, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json().get("control_mode", "eef")
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] get_control_mode failed: {e}")
+            return "eef"
+
+    def start_joint_control(self) -> None:
+        """Switch robot server to joint position control mode."""
+        url = f"{self.server_url}/start_joint_control"
+        try:
+            resp = requests.post(url, timeout=30)
+            resp.raise_for_status()
+            print(f"[INFO] start_joint_control: {resp.json()}")
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] start_joint_control failed: {e}")
+
+    def start_eef_control(self) -> None:
+        """Switch robot server to EEF (impedance) control mode."""
+        url = f"{self.server_url}/start_eef_control"
+        try:
+            resp = requests.post(url, timeout=30)
+            resp.raise_for_status()
+            print(f"[INFO] start_eef_control: {resp.json()}")
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] start_eef_control failed: {e}")
+
+    # def goto_pose_euler(self, pose_euler: Sequence[float]) -> None:
+    #     """Send EEF pose command with euler angles.
+
+    #     Args:
+    #         pose_euler: 6D pose [x, y, z, roll, pitch, yaw]
+    #     """
+    #     xyz = np.array(pose_euler[:3])
+    #     rpy = np.array(pose_euler[3:6])
+    #     quat = euler_2_quat(rpy)
+    #     pose_quat = np.concatenate([xyz, quat])
+    #     self.goto_pose(pose_quat.tolist())
 
     def open_gripper(self) -> None:
         """Open the gripper."""
@@ -175,27 +223,26 @@ class RobotClient:
         except requests.exceptions.RequestException as e:
             print(f"[WARN] move gripper request failed: {e}")
 
-    def reset(
-        self,
-        max_s: float = 10.0,
-        hz: float = 30.0,
-        pos_tol: float = 0.01,
-        rot_tol_rad: float = 0.2,
-    ) -> None:
-        """Reset robot to default pose and open gripper."""
+    def reset(self, **kwargs) -> dict:
+        """Reset robot to default pose and open gripper.
+
+        Server auto-detects control mode:
+          - joint mode: moves to reset joints, waits for convergence
+          - eef mode: holds reset pose via impedance control
+
+        Returns:
+            Server response dict
+        """
         url = f"{self.server_url}/reset_all"
-        payload = {
-            "max_s": float(max_s),
-            "hz": float(hz),
-            "pos_tol": float(pos_tol),
-            "rot_tol_rad": float(rot_tol_rad),
-        }
         try:
-            resp = requests.post(url, json=payload, timeout=30)
+            resp = requests.post(url, json=kwargs, timeout=30)
             if resp.status_code != 200:
                 print(f"[WARN] reset_all failed: {resp.status_code} {resp.text}")
+                return {}
+            return resp.json()
         except requests.exceptions.RequestException as e:
             print(f"[WARN] reset request failed: {e}")
+            return {}
 
     def clear_error(self) -> None:
         """Clear robot error state."""

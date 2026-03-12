@@ -24,6 +24,7 @@ class InferenceLoop:
         camera_width: int = 640,
         camera_height: int = 480,
         camera_fps: int = 30,
+        control_mode: str = "eef",
     ):
         """Initialize inference loop.
 
@@ -35,7 +36,10 @@ class InferenceLoop:
             camera_width: Camera image width
             camera_height: Camera image height
             camera_fps: Camera frame rate
+            control_mode: "eef" for cartesian pose control, "joint" for joint position control
         """
+        assert control_mode in ("eef", "joint"), f"Unknown control_mode: {control_mode}"
+        self.control_mode = control_mode
         self.robot = RobotClient(server_url=robot_url)
         self.policy = PolicyClient(host=policy_host, port=policy_port)
 
@@ -76,21 +80,25 @@ class InferenceLoop:
         """Execute a single action on the robot.
 
         Args:
-            action_vec: 7D action vector [x, y, z, roll, pitch, yaw, gripper]
+            action_vec: Action vector.
+                EEF mode:   7D [x, y, z, roll, pitch, yaw, gripper]
+                Joint mode: 8D [q1, q2, q3, q4, q5, q6, q7, gripper]
             gripper_threshold: Threshold for gripper open/close
         """
-        # Extract pose and gripper
-        xyz = action_vec[:3]
-        rpy = action_vec[3:6]
-        gripper_value = action_vec[6] if len(action_vec) > 6 else None
+        if self.control_mode == "joint":
+            # Joint mode: first 7 values are joint positions
+            joint_positions = action_vec[:7]
+            gripper_value = action_vec[7] if len(action_vec) > 7 else None
+            self.robot.goto_joints(joint_positions.tolist())
+        else:
+            # EEF mode: [x, y, z, roll, pitch, yaw, gripper]
+            xyz = action_vec[:3]
+            rpy = action_vec[3:6]
+            gripper_value = action_vec[6] if len(action_vec) > 6 else None
 
-        # # debug
-        # gripper_value = 1 - gripper_value/256
-        
-        # Convert euler to quaternion and send pose
-        quat = euler_2_quat(rpy)
-        pose_quat = np.concatenate([xyz, quat])
-        self.robot.goto_pose(pose_quat.tolist())
+            quat = euler_2_quat(rpy)
+            pose_quat = np.concatenate([xyz, quat])
+            self.robot.goto_pose(pose_quat.tolist())
 
         # Handle gripper with hysteresis
         if gripper_value is not None:
@@ -136,15 +144,25 @@ class InferenceLoop:
             )
 
             if verbose:
-                xyz = action_vec[:3]
-                rpy = action_vec[3:6]
-                gripper = action_vec[6] if len(action_vec) > 6 else 0
-                print(
-                    f"  Action {i + 1}/{len(all_actions)} | "
-                    f"XYZ=[{xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}] | "
-                    f"RPY=[{rpy[0]:.3f}, {rpy[1]:.3f}, {rpy[2]:.3f}] | "
-                    f"Gripper={gripper:.2f}"
-                )
+                if self.control_mode == "joint":
+                    joints = action_vec[:7]
+                    gripper = action_vec[7] if len(action_vec) > 7 else 0
+                    joints_str = ", ".join(f"{j:.3f}" for j in joints)
+                    print(
+                        f"  Action {i + 1}/{len(all_actions)} | "
+                        f"Joints=[{joints_str}] | "
+                        f"Gripper={gripper:.2f}"
+                    )
+                else:
+                    xyz = action_vec[:3]
+                    rpy = action_vec[3:6]
+                    gripper = action_vec[6] if len(action_vec) > 6 else 0
+                    print(
+                        f"  Action {i + 1}/{len(all_actions)} | "
+                        f"XYZ=[{xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}] | "
+                        f"RPY=[{rpy[0]:.3f}, {rpy[1]:.3f}, {rpy[2]:.3f}] | "
+                        f"Gripper={gripper:.2f}"
+                    )
 
             # Maintain control rate
             elapsed = time.time() - step_start
@@ -153,6 +171,19 @@ class InferenceLoop:
 
         return len(all_actions)
 
+    def _ensure_control_mode(self, verbose: bool = True):
+        """Switch controller mode if needed."""
+        current_mode = self.robot.get_control_mode()
+        if current_mode != self.control_mode:
+            if verbose:
+                print(f"Switching from {current_mode} to {self.control_mode} control...")
+            if self.control_mode == "joint":
+                self.robot.start_joint_control()
+            else:
+                self.robot.start_eef_control()
+        elif verbose:
+            print(f"Already in {self.control_mode} mode.")
+
     def run(
         self,
         prompt: str,
@@ -160,7 +191,6 @@ class InferenceLoop:
         hz: float = 10.0,
         gripper_threshold: float = 0.5,
         reset_first: bool = True,
-        reset_wait: float = 5.0,
         verbose: bool = True,
     ) -> None:
         """Run the inference loop.
@@ -171,21 +201,21 @@ class InferenceLoop:
             hz: Control frequency in Hz
             gripper_threshold: Threshold for gripper open/close
             reset_first: Reset robot before starting
-            reset_wait: Time to wait after reset
             verbose: Print step information
         """
         delay = 1.0 / hz
 
+        self._ensure_control_mode(verbose)
+
         if reset_first:
             if verbose:
                 print("Resetting robot...")
-            self.robot.reset()
-            if verbose:
-                print(f"Waiting {reset_wait}s for reset to complete...")
-            time.sleep(reset_wait)
+            result = self.robot.reset()
+            if verbose and result:
+                print(f"Reset result: {result}")
 
         if verbose:
-            print(f"Starting inference loop at {hz} Hz")
+            print(f"Starting inference loop at {hz} Hz (control_mode={self.control_mode})")
             print(f"Prompt: {prompt}")
             print(f"Max steps: {max_steps}")
             try:
@@ -294,10 +324,11 @@ def main():
         help="Skip initial robot reset",
     )
     parser.add_argument(
-        "--reset-wait",
-        type=float,
-        default=3.0,
-        help="Time to wait after reset",
+        "--control-mode",
+        type=str,
+        default="eef",
+        choices=["eef", "joint"],
+        help="Control mode: 'eef' for cartesian pose, 'joint' for joint positions",
     )
     parser.add_argument(
         "--quiet",
@@ -311,6 +342,7 @@ def main():
         robot_url=args.robot_url,
         policy_host=args.policy_host,
         policy_port=args.policy_port,
+        control_mode=args.control_mode,
     )
 
     try:
@@ -320,7 +352,6 @@ def main():
             hz=args.hz,
             gripper_threshold=args.gripper_threshold,
             reset_first=not args.skip_reset,
-            reset_wait=args.reset_wait,
             verbose=not args.quiet,
         )
     finally:

@@ -18,6 +18,7 @@ from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
 from franka_msgs.srv import SetLoad
 from serl_franka_controllers.msg import ZeroJacobian, DesiredState
 import geometry_msgs.msg as geom_msg
+from std_msgs.msg import Float64MultiArray
 from dynamic_reconfigure.client import Client as ReconfClient
 
 
@@ -57,6 +58,7 @@ class FrankaServer:
         self._command_lock = threading.RLock()
         self._state_ready = threading.Event()
         self._resetting = threading.Event()
+        self._control_mode = "eef"  # "eef" or "joint"
 
         with self._state_lock:
             self.pos = np.zeros((7,), dtype=np.float64)
@@ -77,6 +79,11 @@ class FrankaServer:
         self.eepub = rospy.Publisher(
             "/cartesian_impedance_controller/equilibrium_pose",
             geom_msg.PoseStamped,
+            queue_size=10,
+        )
+        self.joint_pub = rospy.Publisher(
+            "/joint_position_controller/command",
+            Float64MultiArray,
             queue_size=10,
         )
         self.resetpub = rospy.Publisher(
@@ -204,6 +211,63 @@ class FrankaServer:
             time.sleep(1)
             self.imp = None
 
+    def start_joint_controller(self):
+        """Launches the joint position controller"""
+        with self._command_lock:
+            # Set target joint positions to current positions (required by init)
+            with self._state_lock:
+                current_q = self.q.tolist()
+            rospy.set_param("/target_joint_positions", current_q)
+
+            self.joint_controller_proc = subprocess.Popen(
+                [
+                    "roslaunch",
+                    self.ros_pkg_name,
+                    "joint.launch",
+                    "robot_ip:=" + self.robot_ip,
+                    f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
+                ],
+                stdout=subprocess.PIPE,
+            )
+            time.sleep(3)
+
+    def stop_joint_controller(self):
+        """Stops the joint position controller"""
+        with self._command_lock:
+            proc = getattr(self, "joint_controller_proc", None)
+            if proc is None:
+                return
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            time.sleep(1)
+            self.joint_controller_proc = None
+
+    def switch_to_joint_mode(self):
+        """Switch from impedance to joint position control."""
+        if self._control_mode == "joint":
+            return
+        print("Switching to joint control mode...")
+        self.stop_impedance()
+        self.clear()
+        time.sleep(1)
+        self.start_joint_controller()
+        self._control_mode = "joint"
+        print("Joint control mode active")
+
+    def switch_to_eef_mode(self):
+        """Switch from joint position to impedance (EEF) control."""
+        if self._control_mode == "eef":
+            return
+        print("Switching to EEF control mode...")
+        self.stop_joint_controller()
+        self.clear()
+        time.sleep(1)
+        self.start_impedance()
+        self._control_mode = "eef"
+        print("EEF control mode active")
+
     def clear(self):
         """Clears any errors"""
         with self._command_lock:
@@ -286,6 +350,14 @@ class FrankaServer:
             msg.pose.position = geom_msg.Point(pose[0], pose[1], pose[2])
             msg.pose.orientation = geom_msg.Quaternion(pose[3], pose[4], pose[5], pose[6])
             self.eepub.publish(msg)
+
+    def move_joints(self, q: np.ndarray):
+        """Moves to joint positions: [q1, q2, q3, q4, q5, q6, q7]"""
+        with self._command_lock:
+            assert len(q) == 7
+            msg = Float64MultiArray()
+            msg.data = q.tolist()
+            self.joint_pub.publish(msg)
 
     def wait_for_state(self, timeout_s: Optional[float] = None) -> bool:
         return self._state_ready.wait(timeout=timeout_s)
@@ -616,6 +688,42 @@ def main(_):
             robot_server.move(pos)
             return jsonify({"ok": True})
 
+    # Route for Sending joint position command
+    @webapp.route("/joints", methods=["POST"])
+    def joints():
+        q = np.array(request.json["arr"], dtype=np.float64)
+        if len(q) != 7:
+            return jsonify({"ok": False, "error": "expected 7 joint positions"}), 400
+        if robot_server._control_mode != "joint":
+            return jsonify({"ok": False, "error": "not in joint mode, call /start_joint_control first"}), 400
+        with robot_server._try_command() as acquired:
+            if not acquired:
+                return _busy("joints")
+            robot_server.move_joints(q)
+            return jsonify({"ok": True})
+
+    # Route for switching to joint control mode
+    @webapp.route("/start_joint_control", methods=["POST"])
+    def start_joint_control():
+        if robot_server._control_mode == "joint":
+            return jsonify({"ok": True, "mode": "joint", "msg": "already in joint mode"})
+        with robot_server._try_command() as acquired:
+            if not acquired:
+                return _busy("start_joint_control")
+            robot_server.switch_to_joint_mode()
+            return jsonify({"ok": True, "mode": "joint"})
+
+    # Route for switching back to EEF (impedance) control mode
+    @webapp.route("/start_eef_control", methods=["POST"])
+    def start_eef_control():
+        if robot_server._control_mode == "eef":
+            return jsonify({"ok": True, "mode": "eef", "msg": "already in eef mode"})
+        with robot_server._try_command() as acquired:
+            if not acquired:
+                return _busy("start_eef_control")
+            robot_server.switch_to_eef_mode()
+            return jsonify({"ok": True, "mode": "eef"})
+
     # Route for getting all state information
     @webapp.route("/getstate", methods=["POST"])
     def get_state():
@@ -660,27 +768,54 @@ def main(_):
                 "ok": True,
                 "resetting": robot_server.is_resetting(),
                 "state_ready": robot_server._state_ready.is_set(),
+                "control_mode": robot_server._control_mode,
             }
         )
     
-    @webapp.route("/reset_all", methods = ["POST"])
+    JOINT_RESET_Q = [0, 0, 0, -1.9, 0, 2, 0]
+    EEF_RESET_POSE = [0.5671124922989944, 6.47218270568564e-05, 0.4951717570264977,
+                      -3.1281813611027127, 0.06279893041386786, 0.00925549227719924]
+
+    @webapp.route("/reset_all", methods=["POST"])
     def reset_all():
         data = request.get_json(silent=True) or {}
-        max_s = float(data.get("max_s", 10.0))
-        hz = float(data.get("hz", 30.0))
-        pos_tol = float(data.get("pos_tol", 0.01))
-        rot_tol_rad = float(data.get("rot_tol_rad", 0.2))
-        goal =  np.array([0.5671124922989944,6.47218270568564e-05,0.4951717570264977,3.1406597193535584,-0.06601965456071524,4.5924120475993035e-05])
-        goal = np.concatenate([goal[:3], euler_2_quat(goal[3:])])
-        pos = np.array(goal).astype(np.float32)
-        started = robot_server.start_hold_pose_async(
-            pos, max_s=max_s, hz=hz, pos_tol=pos_tol, rot_tol_rad=rot_tol_rad
-        )
-        if not started:
-            return _busy("reset_all")
+
         if gripper_server is not None:
             _start_gripper_command_async(gripper_server.open)
-        return jsonify({"ok": True, "started": True})
+
+        if robot_server._control_mode == "joint":
+            # Joint mode: send reset joint positions via streaming command
+            target = np.array(JOINT_RESET_Q, dtype=np.float64)
+            robot_server.move_joints(target)
+            # Wait for convergence
+            tol = float(data.get("tol", 0.01))
+            timeout = float(data.get("timeout", 10.0))
+            t0 = time.time()
+            converged = False
+            while time.time() - t0 < timeout:
+                time.sleep(0.1)
+                state = robot_server.get_state_copy()
+                q = state["q"]
+                if max(abs(c - t) for c, t in zip(q, JOINT_RESET_Q)) < tol:
+                    converged = True
+                    break
+            return jsonify({"ok": True, "converged": converged,
+                            "mode": "joint", "target": JOINT_RESET_Q})
+        else:
+            # EEF mode: hold pose async
+            max_s = float(data.get("max_s", 10.0))
+            hz = float(data.get("hz", 30.0))
+            pos_tol = float(data.get("pos_tol", 0.01))
+            rot_tol_rad = float(data.get("rot_tol_rad", 0.2))
+            goal = np.array(EEF_RESET_POSE)
+            goal = np.concatenate([goal[:3], euler_2_quat(goal[3:])])
+            pos = goal.astype(np.float32)
+            started = robot_server.start_hold_pose_async(
+                pos, max_s=max_s, hz=hz, pos_tol=pos_tol, rot_tol_rad=rot_tol_rad
+            )
+            if not started:
+                return _busy("reset_all")
+            return jsonify({"ok": True, "started": True, "mode": "eef"})
 
     webapp.run(host=FLAGS.flask_url, threaded=True)
 
